@@ -1,6 +1,10 @@
 {
   "include": ["src"],
   "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["../core/src/*"]
+    },
     "strict": true,
     "useDefineForClassFields": true,
     "noFallthroughCasesInSwitch": true,

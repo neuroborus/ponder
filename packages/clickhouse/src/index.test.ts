@@ -7,6 +7,7 @@ vi.mock("@clickhouse/client", () => ({
 }));
 
 import { createClient } from "@clickhouse/client";
+import { batch } from "./_test/fixtures.js";
 
 type MockFunction = {
   mockReturnValue: (value: unknown) => void;
@@ -30,68 +31,6 @@ const context = {
   },
   metrics: { recordRetry: vi.fn() },
 } satisfies SinkSetupContext;
-
-const batch = {
-  version: 1,
-  id: "batch-1",
-  checkpoint: "0x0000000000000001",
-  events: [
-    {
-      id: "event-1",
-      checkpoint: "0x0000000000000001",
-      chain: { id: 1, name: "mainnet" },
-      name: "Token:Transfer",
-      type: "log",
-      event: {
-        id: "event-1",
-        args: { amount: 1n },
-        log: {
-          address: "0x0000000000000000000000000000000000000001",
-          data: "0x",
-          logIndex: 3,
-          removed: false,
-          topics: [],
-        },
-        block: {
-          baseFeePerGas: null,
-          difficulty: 0n,
-          extraData: "0x",
-          gasLimit: 0n,
-          gasUsed: 0n,
-          hash: "0x",
-          logsBloom: "0x",
-          miner: "0x0000000000000000000000000000000000000000",
-          mixHash: null,
-          nonce: null,
-          number: 42n,
-          parentHash: "0x",
-          receiptsRoot: "0x",
-          sha3Uncles: "0x",
-          size: 0n,
-          stateRoot: "0x",
-          timestamp: 1_700_000_000n,
-          totalDifficulty: null,
-          transactionsRoot: "0x",
-        },
-        transaction: {
-          from: "0x0000000000000000000000000000000000000002",
-          gas: 0n,
-          gasPrice: 0n,
-          hash: "0x",
-          input: "0x",
-          nonce: 0,
-          r: null,
-          s: null,
-          to: "0x0000000000000000000000000000000000000003",
-          transactionIndex: 0,
-          type: "legacy",
-          v: null,
-          value: 0n,
-        },
-      },
-    },
-  ],
-} satisfies FinalizedSinkBatch;
 
 const getExpectedEventId = (
   event: FinalizedSinkBatch["events"][number],
@@ -244,6 +183,11 @@ test("createClickHouseSink() assigns distinct event ids per callback", async () 
 });
 
 test("createClickHouseSink() omits contract address for account transaction events", async () => {
+  const sourceEvent = batch.events[0]!.event;
+  if (!("transaction" in sourceEvent)) {
+    throw new Error("Expected transaction event fixture");
+  }
+
   const sink = createClickHouseSink({
     url: "http://localhost:8123",
     projectId: "project",
@@ -262,8 +206,8 @@ test("createClickHouseSink() omits contract address for account transaction even
         type: "transaction",
         event: {
           id: "event-2",
-          block: batch.events[0]!.event.block,
-          transaction: batch.events[0]!.event.transaction,
+          block: sourceEvent.block,
+          transaction: sourceEvent.transaction,
         },
       },
     ],
