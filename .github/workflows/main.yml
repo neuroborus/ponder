@@ -130,6 +130,12 @@ jobs:
         with:
           bun-version: 1.3.4
 
+      - name: Build ClickHouse acceptance dependencies
+        if: ${{ matrix.database == 'Postgres' }}
+        run: |
+          pnpm --filter ponder build
+          pnpm --filter "@ponder/clickhouse" build
+
       - name: Typecheck ClickHouse package
         if: ${{ matrix.runtime == 'node' && matrix.database == 'Postgres' }}
         run: |
@@ -149,13 +155,22 @@ jobs:
       - name: Test ClickHouse acceptance
         env:
           CLICKHOUSE_URL: http://127.0.0.1:8123
-          DATABASE_URL: ${{ matrix.database == 'Postgres' && steps.postgres.outputs.connection-uri || '' }}
         run: |
           if [ "${{ matrix.runtime }}" = "bun" ]; then
             pnpm --filter "@ponder/clickhouse" test:acceptance:bun
-            pnpm --filter clickhouse-acceptance test:bun
           else
             pnpm --filter "@ponder/clickhouse" test:acceptance
+          fi
+
+      - name: Test ClickHouse delivery acceptance
+        if: ${{ matrix.database == 'Postgres' }}
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          DATABASE_URL: ${{ steps.postgres.outputs.connection-uri }}
+        run: |
+          if [ "${{ matrix.runtime }}" = "bun" ]; then
+            pnpm --filter clickhouse-acceptance test:bun
+          else
             pnpm --filter clickhouse-acceptance test
           fi
 
