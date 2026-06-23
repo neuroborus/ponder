@@ -12,10 +12,3 @@ export const clickhouseUrl = process.env.CLICKHOUSE_URL;
 
 export const acceptanceTest =
   isAcceptanceRun && clickhouseUrl !== undefined ? test : test.skip;
-
-export const deliveryTest =
-  isAcceptanceRun &&
-  clickhouseUrl !== undefined &&
-  process.env.DATABASE_URL !== undefined
-    ? test
-    : test.skip;

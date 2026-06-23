@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   context,
   setupCleanup,
@@ -8,15 +9,31 @@ import {
 import { getFinalizedEventsMultichain } from "@/runtime/realtime.js";
 import { createSinkService } from "@/sink/index.js";
 import { ZERO_CHECKPOINT, encodeCheckpoint } from "@/utils/checkpoint.js";
-import { afterAll, beforeEach, expect, vi } from "vitest";
-import { clickhouseUrl, deliveryTest } from "./_test/acceptance.js";
-import { createClickHouseServer } from "./_test/clickhouseServer.js";
+import { createClickHouseSink } from "@ponder/clickhouse";
+import type { IndexingSink } from "ponder";
+import { afterAll, afterEach, beforeEach, expect, test, vi } from "vitest";
+import { createClickHouseServer } from "./clickhouseServer.js";
 import {
   createBlockEvent,
   getPendingDeliveries,
   namespace,
-} from "./_test/delivery.js";
-import { createClickHouseSink } from "./index.js";
+} from "./fixtures.js";
+
+const isAcceptanceRun = process.env.PONDER_CLICKHOUSE_ACCEPTANCE === "1";
+const clickhouseUrl = process.env.CLICKHOUSE_URL;
+
+if (isAcceptanceRun && clickhouseUrl === undefined) {
+  throw new Error(
+    "CLICKHOUSE_URL is required for delivery acceptance tests. Export it in the shell or pass it inline.",
+  );
+}
+
+const deliveryTest =
+  isAcceptanceRun &&
+  clickhouseUrl !== undefined &&
+  process.env.DATABASE_URL !== undefined
+    ? test
+    : test.skip;
 
 const table = "ponder_clickhouse_delivery";
 const qualifiedTable = `default.${table}`;
@@ -24,6 +41,8 @@ const clickhouse =
   clickhouseUrl === undefined
     ? undefined
     : createClickHouseServer(clickhouseUrl);
+
+const sinks: IndexingSink[] = [];
 
 const createSink = (url: string, autoCreate = true) =>
   createClickHouseSink({
@@ -34,20 +53,13 @@ const createSink = (url: string, autoCreate = true) =>
     schema: { table, autoCreate },
   });
 
-const setupSink = async (url: string, autoCreate = true) => {
-  const sink = createSink(url, autoCreate);
-  await sink.setup?.({
-    logger: context.common.logger.child({ sink: "clickhouse" }),
-    metrics: {
-      recordRetry: () => {
-        context.common.metrics.ponder_sink_delivery_retry_total.inc({
-          sink: "clickhouse",
-        });
-      },
-    },
-  });
+const trackSink = (sink: IndexingSink) => {
+  sinks.push(sink);
   return sink;
 };
+
+const getEventId = (checkpoint: string, name: string, id: string): string =>
+  createHash("sha256").update(`${checkpoint}:${name}:${id}`).digest("hex");
 
 beforeEach(setupCommon);
 beforeEach(setupIsolatedDatabase);
@@ -58,20 +70,24 @@ beforeEach(async () => {
   await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedTable}`);
 });
 
+afterEach(async () => {
+  await Promise.all(sinks.splice(0).map((sink) => sink.shutdown?.()));
+});
+
 afterAll(async () => {
   if (clickhouse === undefined) return;
   await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedTable}`);
 });
 
 deliveryTest(
-  "does not deliver a Postgres outbox batch to ClickHouse before drain",
+  "does not deliver a Postgres outbox batch to ClickHouse before commit",
   async () => {
     if (clickhouse === undefined || clickhouseUrl === undefined) return;
 
     const { database } = await setupDatabaseServices({
       namespaceBuild: namespace,
     });
-    const sink = await setupSink(clickhouseUrl);
+    const sink = trackSink(createSink(clickhouseUrl));
     const service = createSinkService({
       common: context.common,
       database,
@@ -80,17 +96,18 @@ deliveryTest(
     });
     const event = createBlockEvent({ id: "event-historical" });
 
-    await database.userQB.transaction((tx) => service.enqueue(tx, [event]));
+    await database.userQB.transaction(async (tx) => {
+      await service.enqueue(tx, [event]);
+      expect(await clickhouse.getEventCount(qualifiedTable)).toBe(0);
+    });
 
     expect(await getPendingDeliveries(database)).toHaveLength(1);
     expect(await clickhouse.getEventCount(qualifiedTable)).toBe(0);
 
-    await service.drain();
+    await service.start();
 
     expect(await getPendingDeliveries(database)).toHaveLength(0);
     expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
-
-    await sink.shutdown?.();
   },
 );
 
@@ -107,29 +124,26 @@ deliveryTest(
       common: context.common,
       database,
       namespace,
-      sinks: [await setupSink("http://127.0.0.1:1", false)],
+      sinks: [trackSink(createSink("http://127.0.0.1:1", false))],
     });
 
     await database.userQB.transaction((tx) => service.enqueue(tx, [event]));
 
-    await expect(service.drain()).rejects.toThrow();
+    await expect(service.start()).rejects.toThrow();
     expect(await getPendingDeliveries(database)).toHaveLength(1);
     expect(await clickhouse.getEventCount(qualifiedTable)).toBe(0);
 
-    const recoveredSink = await setupSink(clickhouseUrl);
     const restarted = createSinkService({
       common: context.common,
       database,
       namespace,
-      sinks: [recoveredSink],
+      sinks: [trackSink(createSink(clickhouseUrl))],
     });
 
-    await restarted.drain();
+    await restarted.start();
 
     expect(await getPendingDeliveries(database)).toHaveLength(0);
     expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
-
-    await recoveredSink.shutdown?.();
   },
 );
 
@@ -141,7 +155,7 @@ deliveryTest(
     const { database } = await setupDatabaseServices({
       namespaceBuild: namespace,
     });
-    const sink = await setupSink(clickhouseUrl);
+    const sink = trackSink(createSink(clickhouseUrl));
     const service = createSinkService({
       common: context.common,
       database,
@@ -169,26 +183,25 @@ deliveryTest(
       return originalWrap(...args);
     }) as typeof database.userQB.wrap);
 
-    await expect(service.drain()).rejects.toThrow("ack failed");
-    expect(await getPendingDeliveries(database)).toHaveLength(1);
-    expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
+    try {
+      await expect(service.start()).rejects.toThrow("ack failed");
+      expect(await getPendingDeliveries(database)).toHaveLength(1);
+      expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
 
-    vi.restoreAllMocks();
+      const restarted = createSinkService({
+        common: context.common,
+        database,
+        namespace,
+        sinks: [trackSink(createSink(clickhouseUrl))],
+      });
 
-    const replayedSink = await setupSink(clickhouseUrl);
-    const restarted = createSinkService({
-      common: context.common,
-      database,
-      namespace,
-      sinks: [replayedSink],
-    });
+      await restarted.start();
 
-    await restarted.drain();
-
-    expect(await getPendingDeliveries(database)).toHaveLength(0);
-    expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
-
-    await replayedSink.shutdown?.();
+      expect(await getPendingDeliveries(database)).toHaveLength(0);
+      expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
   },
 );
 
@@ -200,7 +213,7 @@ deliveryTest(
     const { database } = await setupDatabaseServices({
       namespaceBuild: namespace,
     });
-    const sink = await setupSink(clickhouseUrl);
+    const sink = trackSink(createSink(clickhouseUrl));
     const service = createSinkService({
       common: context.common,
       database,
@@ -234,10 +247,17 @@ deliveryTest(
     await database.userQB.transaction((tx) =>
       service.enqueue(tx, finalizedEvents),
     );
-    await service.drain();
+    await service.start();
 
-    expect(await clickhouse.getEventCount(qualifiedTable)).toBe(1);
+    const rows = await clickhouse.query<{ event_id: string }>(`
+      SELECT event_id
+      FROM ${qualifiedTable} FINAL
+    `);
+    const expectedEventId = getEventId(chainB.checkpoint, "Block", "event-b");
 
-    await sink.shutdown?.();
+    expect(rows).toStrictEqual([{ event_id: expectedEventId }]);
+    expect(rows.map((row) => row.event_id)).not.toContain(
+      getEventId(chainA.checkpoint, "Block", "event-a"),
+    );
   },
 );

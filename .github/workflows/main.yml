@@ -132,7 +132,9 @@ jobs:
 
       - name: Typecheck ClickHouse package
         if: ${{ matrix.runtime == 'node' && matrix.database == 'Postgres' }}
-        run: pnpm --filter "@ponder/clickhouse" typecheck
+        run: |
+          pnpm --filter "@ponder/clickhouse" typecheck
+          pnpm --filter clickhouse-acceptance typecheck
 
       - name: Test finalized sink contract
         env:
@@ -151,8 +153,10 @@ jobs:
         run: |
           if [ "${{ matrix.runtime }}" = "bun" ]; then
             pnpm --filter "@ponder/clickhouse" test:acceptance:bun
+            pnpm --filter clickhouse-acceptance test:bun
           else
             pnpm --filter "@ponder/clickhouse" test:acceptance
+            pnpm --filter clickhouse-acceptance test
           fi
 
 

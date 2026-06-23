@@ -1,5 +1,5 @@
-import type { SinkSetupContext } from "ponder";
-import { afterAll, beforeEach, expect, vi } from "vitest";
+import type { IndexingSink, SinkSetupContext } from "ponder";
+import { afterAll, afterEach, beforeEach, expect, vi } from "vitest";
 import { acceptanceTest, clickhouseUrl } from "./_test/acceptance.js";
 import { createClickHouseServer } from "./_test/clickhouseServer.js";
 import { createBatch } from "./_test/fixtures.js";
@@ -25,6 +25,13 @@ const context = {
   metrics: { recordRetry: vi.fn() },
 } satisfies SinkSetupContext;
 
+const sinks: IndexingSink[] = [];
+
+const trackSink = (sink: IndexingSink) => {
+  sinks.push(sink);
+  return sink;
+};
+
 const createSink = ({
   url = clickhouseUrl,
   autoCreate = true,
@@ -45,10 +52,22 @@ const createSink = ({
   });
 };
 
+const openSink = (
+  options: {
+    url?: string;
+    autoCreate?: boolean;
+    maxRetries?: number;
+  } = {},
+) => trackSink(createSink(options));
+
 beforeEach(async () => {
   vi.clearAllMocks();
   if (clickhouseUrl === undefined) return;
   await requireClickhouse().execute(`DROP TABLE IF EXISTS ${qualifiedTable}`);
+});
+
+afterEach(async () => {
+  await Promise.all(sinks.splice(0).map((sink) => sink.shutdown?.()));
 });
 
 afterAll(async () => {
@@ -59,7 +78,7 @@ afterAll(async () => {
 acceptanceTest(
   "createClickHouseSink() creates a table and writes a historical finalized batch",
   async () => {
-    const sink = createSink();
+    const sink = openSink();
 
     await sink.setup?.(context);
     await sink.writeFinalizedBatch(
@@ -86,15 +105,13 @@ acceptanceTest(
         payload: expect.stringContaining('"amount":"1"'),
       },
     ]);
-
-    await sink.shutdown?.();
   },
 );
 
 acceptanceTest(
   "createClickHouseSink() writes a realtime finalized batch",
   async () => {
-    const sink = createSink();
+    const sink = openSink();
 
     await sink.setup?.(context);
     await sink.writeFinalizedBatch(
@@ -106,8 +123,6 @@ acceptanceTest(
     );
 
     expect(await requireClickhouse().getEventCount(qualifiedTable)).toBe(1);
-
-    await sink.shutdown?.();
   },
 );
 
@@ -118,25 +133,22 @@ acceptanceTest(
       batchId: "batch-replay",
       eventId: "event-replay",
     });
-    const failedSink = createSink({
+    const failedSink = openSink({
       url: "http://127.0.0.1:1",
       autoCreate: false,
     });
 
     await failedSink.setup?.(context);
     await expect(failedSink.writeFinalizedBatch(batch)).rejects.toThrow();
-    await failedSink.shutdown?.();
 
-    const firstSink = createSink();
+    const firstSink = openSink();
 
     await firstSink.setup?.(context);
     await firstSink.writeFinalizedBatch(batch);
-    await firstSink.shutdown?.();
 
-    const restartedSink = createSink();
+    const restartedSink = openSink();
     await restartedSink.setup?.(context);
     await restartedSink.writeFinalizedBatch(batch);
-    await restartedSink.shutdown?.();
 
     expect(await requireClickhouse().getEventCount(qualifiedTable)).toBe(1);
   },
@@ -145,13 +157,12 @@ acceptanceTest(
 acceptanceTest(
   "createClickHouseSink() retains written rows through shutdown",
   async () => {
-    const sink = createSink();
+    const sink = openSink();
 
     await sink.setup?.(context);
     await sink.writeFinalizedBatch(
       createBatch({ batchId: "batch-shutdown", eventId: "event-shutdown" }),
     );
-    await sink.shutdown?.();
 
     expect(await requireClickhouse().getEventCount(qualifiedTable)).toBe(1);
   },
@@ -164,7 +175,7 @@ acceptanceTest(
       createClickHouseSink({ url: "invalid", projectId: "acceptance" }),
     ).toThrow("url must be a valid HTTP or HTTPS URL");
 
-    const sink = createSink({ url: "http://127.0.0.1:1", maxRetries: 1 });
+    const sink = openSink({ url: "http://127.0.0.1:1", maxRetries: 1 });
     await sink.setup?.(context);
     await expect(sink.writeFinalizedBatch(createBatch())).rejects.toThrow();
 
@@ -172,7 +183,5 @@ acceptanceTest(
     expect(context.logger.error).toHaveBeenCalledWith(
       expect.objectContaining({ operation: "write", retry_count: 1 }),
     );
-
-    await sink.shutdown?.();
   },
 );

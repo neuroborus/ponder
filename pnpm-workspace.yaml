@@ -1,5 +1,6 @@
 packages:
   - benchmark
+  - clickhouse-acceptance
   - docs
   - simulation-test
   - examples/**

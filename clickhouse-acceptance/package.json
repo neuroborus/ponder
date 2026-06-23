@@ -1,0 +1,16 @@
+{
+  "name": "clickhouse-acceptance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "PONDER_CLICKHOUSE_ACCEPTANCE=1 vitest --run",
+    "test:bun": "PONDER_CLICKHOUSE_ACCEPTANCE=1 bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@ponder/clickhouse": "workspace:*",
+    "@types/node": "^20.10.0",
+    "ponder": "workspace:*",
+    "vitest": "1.6.1"
+  }
+}
