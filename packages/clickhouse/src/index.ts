@@ -4,12 +4,16 @@ import type {
   FinalizedSinkBatch,
   FinalizedSinkEvent,
   IndexingSink,
+  LiveSinkBatch,
+  ReorgSinkBatch,
   SinkSetupContext,
 } from "ponder";
 
-const SCHEMA_VERSION = 1;
+const FINALIZED_SCHEMA_VERSION = 1;
+const LIVE_SCHEMA_VERSION = 2;
 const DEFAULT_DATABASE = "default";
 const DEFAULT_TABLE = "ponder_events";
+const DEFAULT_LIVE_TABLE = "ponder_events_v2";
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_DELAY_MS = 250;
 const MAX_RETRIES = 10;
@@ -18,7 +22,13 @@ const MAX_RETRY_DELAY_MS = 60_000;
 const identifierRegex = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const projectIdRegex = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
-type Operation = "create_table" | "write";
+type Operation =
+  | "create_table"
+  | "write_finalized"
+  | "write_live"
+  | "write_reorg";
+
+type SinkBatch = FinalizedSinkBatch | LiveSinkBatch | ReorgSinkBatch;
 
 export type ClickHouseSinkConfig = {
   /** ClickHouse HTTP endpoint. */
@@ -35,11 +45,13 @@ export type ClickHouseSinkConfig = {
   maxRetries?: number;
   /** Initial retry delay in milliseconds. Default: `250`. */
   retryDelayMs?: number;
+  /** Write provisional events and reorg revocations. Default: `false`. */
+  live?: boolean;
   /** Target table configuration. */
   schema?: {
     /** Existing ClickHouse database. Default: `"default"`. */
     database?: string;
-    /** Event table name. Default: `"ponder_events"`. */
+    /** Event table name. Defaults to `"ponder_events_v2"` in live mode. */
     table?: string;
     /** Create the event table if it does not exist. Default: `false`. */
     autoCreate?: boolean;
@@ -54,6 +66,7 @@ type ResolvedClickHouseSinkConfig = {
   requestTimeout: number | undefined;
   maxRetries: number;
   retryDelayMs: number;
+  live: boolean;
   database: string;
   table: string;
   autoCreate: boolean;
@@ -75,6 +88,11 @@ type ClickHouseEventRow = {
   contract_name: string | null;
   contract_address: string | null;
   payload: string;
+};
+
+type ClickHouseLiveEventRow = ClickHouseEventRow & {
+  row_kind: "event" | "revocation";
+  row_version: string;
 };
 
 const getConfigError = (message: string): Error =>
@@ -181,6 +199,22 @@ const resolveConfig = (
     throw getConfigError("schema.autoCreate must be a boolean.");
   }
 
+  if (config.live !== undefined && typeof config.live !== "boolean") {
+    throw getConfigError("live must be a boolean.");
+  }
+
+  const live = config.live ?? false;
+  const table = validateIdentifier({
+    value: schema.table ?? (live ? DEFAULT_LIVE_TABLE : DEFAULT_TABLE),
+    name: "schema.table",
+  });
+
+  if (live && table === DEFAULT_TABLE) {
+    throw getConfigError(
+      `schema.table must not be "${DEFAULT_TABLE}" when live is enabled; use a v2 table.`,
+    );
+  }
+
   return {
     url: url.toString(),
     projectId: config.projectId,
@@ -212,14 +246,12 @@ const resolveConfig = (
         min: 0,
         max: MAX_RETRY_DELAY_MS,
       }) ?? DEFAULT_RETRY_DELAY_MS,
+    live,
     database: validateIdentifier({
       value: schema.database ?? DEFAULT_DATABASE,
       name: "schema.database",
     }),
-    table: validateIdentifier({
-      value: schema.table ?? DEFAULT_TABLE,
-      name: "schema.table",
-    }),
+    table,
     autoCreate: schema.autoCreate ?? false,
   };
 };
@@ -270,16 +302,20 @@ const getEventId = (event: FinalizedSinkEvent): string =>
 
 const mapEvent = ({
   event,
-  batch,
+  batchId,
+  eventId,
   projectId,
+  schemaVersion,
 }: {
   event: FinalizedSinkEvent;
-  batch: FinalizedSinkBatch;
+  batchId: string;
+  eventId: string;
   projectId: string;
+  schemaVersion: number;
 }): ClickHouseEventRow => ({
-  schema_version: SCHEMA_VERSION,
-  event_id: getEventId(event),
-  batch_id: batch.id,
+  schema_version: schemaVersion,
+  event_id: eventId,
+  batch_id: batchId,
   project_id: projectId,
   chain_id: event.chain.id,
   checkpoint: event.checkpoint,
@@ -294,11 +330,70 @@ const mapEvent = ({
   payload: stringifyPayload(event.event),
 });
 
+const getLiveEventId = (event: FinalizedSinkEvent): string =>
+  createHash("sha256")
+    .update(`${event.chain.id}:${event.checkpoint}:${event.name}:${event.id}`)
+    .digest("hex");
+
+const mapLiveEvent = ({
+  event,
+  batchId,
+  projectId,
+  rowKind,
+  rowVersion,
+}: {
+  event: FinalizedSinkEvent;
+  batchId: string;
+  projectId: string;
+  rowKind: ClickHouseLiveEventRow["row_kind"];
+  rowVersion: bigint;
+}): ClickHouseLiveEventRow => ({
+  ...mapEvent({
+    event,
+    batchId,
+    eventId: getLiveEventId(event),
+    projectId,
+    schemaVersion: LIVE_SCHEMA_VERSION,
+  }),
+  row_kind: rowKind,
+  row_version: rowVersion.toString(),
+});
+
 const getCreateTableQuery = ({
   database,
   table,
-}: Pick<ResolvedClickHouseSinkConfig, "database" | "table">): string => {
+  live,
+}: Pick<
+  ResolvedClickHouseSinkConfig,
+  "database" | "table" | "live"
+>): string => {
   const qualifiedTable = `${database}.${table}`;
+
+  if (live) {
+    return `
+CREATE TABLE IF NOT EXISTS ${qualifiedTable} (
+  schema_version UInt8,
+  event_id String,
+  batch_id String,
+  project_id String,
+  chain_id UInt64,
+  checkpoint String,
+  row_kind LowCardinality(String),
+  row_version UInt64,
+  block_number UInt64,
+  block_timestamp DateTime,
+  transaction_hash Nullable(String),
+  log_index Nullable(UInt64),
+  event_name String,
+  event_type LowCardinality(String),
+  contract_name Nullable(String),
+  contract_address Nullable(String),
+  payload String,
+  inserted_at DateTime64(3) DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(row_version)
+ORDER BY (project_id, event_id)`;
+  }
 
   return `
 CREATE TABLE IF NOT EXISTS ${qualifiedTable} (
@@ -327,10 +422,12 @@ const sleep = (duration: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, duration));
 
 /**
- * Creates a finalized, at-least-once ClickHouse analytics sink.
+ * Creates an at-least-once ClickHouse analytics sink.
  *
- * The target database must already exist. `schema.autoCreate` creates only the
- * event table and never changes or removes an existing table.
+ * By default it writes finalized events. `live: true` writes provisional events
+ * and durable reorg revocations to a separate v2 table by default. The target
+ * database must already exist. `schema.autoCreate` creates only the event table
+ * and never changes or removes an existing table.
  */
 export const createClickHouseSink = (
   config: ClickHouseSinkConfig,
@@ -352,7 +449,7 @@ export const createClickHouseSink = (
     execute,
   }: {
     operation: Operation;
-    batch?: FinalizedSinkBatch;
+    batch?: SinkBatch;
     execute: () => Promise<void>;
   }): Promise<void> => {
     for (let attempt = 0; ; attempt++) {
@@ -393,7 +490,29 @@ export const createClickHouseSink = (
     }
   };
 
-  return {
+  const write = async ({
+    batch,
+    operation,
+    values,
+  }: {
+    batch: SinkBatch;
+    operation: Operation;
+    values: ClickHouseEventRow[] | ClickHouseLiveEventRow[];
+  }): Promise<void> => {
+    await withRetry({
+      operation,
+      batch,
+      execute: async () => {
+        await client.insert({
+          table: resolved.table,
+          format: "JSONEachRow",
+          values,
+        });
+      },
+    });
+  };
+
+  const sink: IndexingSink = {
     name: "clickhouse",
     async setup(setupContext): Promise<void> {
       context = setupContext;
@@ -423,18 +542,28 @@ export const createClickHouseSink = (
     async writeFinalizedBatch(batch): Promise<void> {
       if (batch.events.length === 0) return;
 
-      await withRetry({
-        operation: "write",
+      await write({
         batch,
-        execute: async () => {
-          await client.insert({
-            table: resolved.table,
-            format: "JSONEachRow",
-            values: batch.events.map((event) =>
-              mapEvent({ event, batch, projectId: resolved.projectId }),
+        operation: "write_finalized",
+        values: resolved.live
+          ? batch.events.map((event) =>
+              mapLiveEvent({
+                event,
+                batchId: batch.id,
+                projectId: resolved.projectId,
+                rowKind: "event",
+                rowVersion: 0n,
+              }),
+            )
+          : batch.events.map((event) =>
+              mapEvent({
+                event,
+                batchId: batch.id,
+                eventId: getEventId(event),
+                projectId: resolved.projectId,
+                schemaVersion: FINALIZED_SCHEMA_VERSION,
+              }),
             ),
-          });
-        },
       });
 
       context?.logger.debug({
@@ -448,4 +577,58 @@ export const createClickHouseSink = (
       await client.close();
     },
   };
+
+  if (resolved.live) {
+    sink.writeLiveBatch = async (batch): Promise<void> => {
+      if (batch.events.length === 0) return;
+
+      await write({
+        batch,
+        operation: "write_live",
+        values: batch.events.map((event) =>
+          mapLiveEvent({
+            event,
+            batchId: batch.id,
+            projectId: resolved.projectId,
+            rowKind: "event",
+            rowVersion: batch.sequence,
+          }),
+        ),
+      });
+
+      context?.logger.debug({
+        msg: "Wrote live ClickHouse batch",
+        batch_id: batch.id,
+        checkpoint: batch.checkpoint,
+        event_count: batch.events.length,
+      });
+    };
+
+    sink.writeReorgBatch = async (batch): Promise<void> => {
+      if (batch.events.length === 0) return;
+
+      await write({
+        batch,
+        operation: "write_reorg",
+        values: batch.events.map((event) =>
+          mapLiveEvent({
+            event,
+            batchId: batch.id,
+            projectId: resolved.projectId,
+            rowKind: "revocation",
+            rowVersion: batch.sequence,
+          }),
+        ),
+      });
+
+      context?.logger.debug({
+        msg: "Wrote ClickHouse reorg batch",
+        batch_id: batch.id,
+        checkpoint: batch.checkpoint,
+        event_count: batch.events.length,
+      });
+    };
+  }
+
+  return sink;
 };

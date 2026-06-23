@@ -37,6 +37,8 @@ const deliveryTest =
 
 const table = "ponder_clickhouse_delivery";
 const qualifiedTable = `default.${table}`;
+const liveTable = "ponder_clickhouse_live_delivery";
+const qualifiedLiveTable = `default.${liveTable}`;
 const clickhouse =
   clickhouseUrl === undefined
     ? undefined
@@ -44,13 +46,14 @@ const clickhouse =
 
 const sinks: IndexingSink[] = [];
 
-const createSink = (url: string, autoCreate = true) =>
+const createSink = (url: string, autoCreate = true, live = false) =>
   createClickHouseSink({
     url,
     projectId: "delivery",
+    live,
     maxRetries: 0,
     retryDelayMs: 0,
-    schema: { table, autoCreate },
+    schema: { table: live ? liveTable : table, autoCreate },
   });
 
 const trackSink = (sink: IndexingSink) => {
@@ -68,6 +71,7 @@ beforeEach(setupCleanup);
 beforeEach(async () => {
   if (clickhouse === undefined) return;
   await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedTable}`);
+  await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedLiveTable}`);
 });
 
 afterEach(async () => {
@@ -77,6 +81,7 @@ afterEach(async () => {
 afterAll(async () => {
   if (clickhouse === undefined) return;
   await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedTable}`);
+  await clickhouse.execute(`DROP TABLE IF EXISTS ${qualifiedLiveTable}`);
 });
 
 deliveryTest(
@@ -259,5 +264,127 @@ deliveryTest(
     expect(rows.map((row) => row.event_id)).not.toContain(
       getEventId(chainA.checkpoint, "Block", "event-a"),
     );
+  },
+);
+
+deliveryTest(
+  "delivers a live event and its durable reorg marker to ClickHouse",
+  async () => {
+    if (clickhouse === undefined || clickhouseUrl === undefined) return;
+
+    const { database } = await setupDatabaseServices({
+      namespaceBuild: namespace,
+    });
+    const sink = trackSink(createSink(clickhouseUrl, true, true));
+    if (
+      sink.writeLiveBatch === undefined ||
+      sink.writeReorgBatch === undefined
+    ) {
+      throw new Error("Expected a live ClickHouse sink");
+    }
+
+    const service = createSinkService({
+      common: context.common,
+      database,
+      namespace,
+      sinks: [sink],
+    });
+    const event = createBlockEvent({ id: "event-live" });
+
+    await service.start();
+    await database.userQB.transaction(async (tx) => {
+      await service.enqueueLive(tx, [event]);
+      expect(
+        await clickhouse.query<{ event_id: string }>(`
+          SELECT event_id
+          FROM ${qualifiedLiveTable} FINAL
+          WHERE project_id = 'delivery' AND row_kind = 'event'
+        `),
+      ).toStrictEqual([]);
+    });
+
+    await service.drain();
+    expect(
+      await clickhouse.query<{ event_id: string }>(`
+        SELECT event_id
+        FROM ${qualifiedLiveTable} FINAL
+        WHERE project_id = 'delivery' AND row_kind = 'event'
+      `),
+    ).toHaveLength(1);
+
+    await database.userQB.transaction((tx) =>
+      service.enqueueReorg(tx, {
+        chain: { id: event.chain.id, name: event.chain.name },
+        checkpoint: event.checkpoint,
+        events: [event],
+      }),
+    );
+    await service.drain();
+
+    expect(
+      await clickhouse.query<{ event_id: string }>(`
+        SELECT event_id
+        FROM ${qualifiedLiveTable} FINAL
+        WHERE project_id = 'delivery' AND row_kind = 'event'
+      `),
+    ).toStrictEqual([]);
+  },
+);
+
+deliveryTest(
+  "replays live delivery before its reorg marker after restart",
+  async () => {
+    if (clickhouse === undefined || clickhouseUrl === undefined) return;
+
+    const { database } = await setupDatabaseServices({
+      namespaceBuild: namespace,
+    });
+    const event = createBlockEvent({ id: "event-live-replay" });
+    const service = createSinkService({
+      common: context.common,
+      database,
+      namespace,
+      sinks: [trackSink(createSink("http://127.0.0.1:1", false, true))],
+    });
+
+    await database.userQB.transaction((tx) => service.enqueueLive(tx, [event]));
+    await database.userQB.transaction((tx) =>
+      service.enqueueReorg(tx, {
+        chain: { id: event.chain.id, name: event.chain.name },
+        checkpoint: event.checkpoint,
+        events: [event],
+      }),
+    );
+
+    await expect(service.start()).rejects.toThrow();
+
+    const restarted = createSinkService({
+      common: context.common,
+      database,
+      namespace,
+      sinks: [trackSink(createSink(clickhouseUrl, true, true))],
+    });
+
+    await restarted.start();
+
+    expect(
+      await clickhouse.query<{ event_id: string }>(`
+        SELECT event_id
+        FROM ${qualifiedLiveTable} FINAL
+        WHERE project_id = 'delivery' AND row_kind = 'event'
+      `),
+    ).toStrictEqual([]);
+    const rows = await clickhouse.query<{
+      row_kind: string;
+      row_version: string | number;
+    }>(`
+      SELECT row_kind, row_version
+      FROM ${qualifiedLiveTable} FINAL
+      WHERE project_id = 'delivery'
+    `);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ row_kind: "revocation" });
+    expect(Number(rows[0]!.row_version)).toBe(2);
   },
 );

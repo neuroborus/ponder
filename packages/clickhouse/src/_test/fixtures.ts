@@ -1,4 +1,4 @@
-import type { FinalizedSinkBatch } from "ponder";
+import type { FinalizedSinkBatch, LiveSinkBatch, ReorgSinkBatch } from "ponder";
 
 export const createBatch = ({
   batchId = "batch-1",
@@ -71,3 +71,44 @@ export const createBatch = ({
 });
 
 export const batch = createBatch();
+
+export const createLiveBatch = ({
+  batchId = "live-batch-1",
+  checkpoint = "0x0000000000000001",
+  eventId = "event-1",
+  sequence = 1n,
+}: {
+  batchId?: string;
+  checkpoint?: string;
+  eventId?: string;
+  sequence?: bigint;
+} = {}): LiveSinkBatch => {
+  const finalizedBatch = createBatch({ batchId, checkpoint, eventId });
+
+  return {
+    ...finalizedBatch,
+    chain: finalizedBatch.events[0]!.chain,
+    sequence,
+  };
+};
+
+export const createReorgBatch = ({
+  batchId = "reorg-batch-1",
+  checkpoint = "0x0000000000000001",
+  eventId = "event-1",
+  sequence = 2n,
+}: {
+  batchId?: string;
+  checkpoint?: string;
+  eventId?: string;
+  sequence?: bigint;
+} = {}): ReorgSinkBatch => {
+  const liveBatch = createLiveBatch({
+    batchId,
+    checkpoint,
+    eventId,
+    sequence,
+  });
+
+  return liveBatch;
+};
