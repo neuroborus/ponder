@@ -111,6 +111,7 @@ export const sidebar = {
     {
       text: "Advanced",
       items: [
+        { text: "ClickHouse", link: "/docs/advanced/clickhouse" },
         { text: "Observability", link: "/docs/advanced/observability" },
         { text: "Telemetry", link: "/docs/advanced/telemetry" },
       ],
