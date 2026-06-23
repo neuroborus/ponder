@@ -38,6 +38,23 @@ test("createConfig sinks", () => {
   assertType<readonly IndexingSink[] | undefined>(config.sinks);
 });
 
+test("createConfig live sinks", () => {
+  const sink = {
+    name: "analytics",
+    writeFinalizedBatch: async () => {},
+    writeLiveBatch: async () => {},
+    writeReorgBatch: async () => {},
+  } satisfies IndexingSink;
+  const config = createConfig({
+    chains: {
+      mainnet: { id: 1, rpc: "https://rpc.com" },
+    },
+    sinks: [sink],
+  });
+
+  assertType<readonly IndexingSink[] | undefined>(config.sinks);
+});
+
 test("createConfig rejects invalid sinks", () => {
   createConfig({
     chains: {

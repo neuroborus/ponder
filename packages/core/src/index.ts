@@ -31,9 +31,12 @@ export type {
   FinalizedSinkBatch,
   FinalizedSinkEvent,
   IndexingSink,
+  LiveSinkBatch,
+  ReorgSinkBatch,
   SinkLogger,
   SinkMetrics,
   SinkSetupContext,
+  SinkEvent,
 } from "@/internal/types.js";
 
 export {

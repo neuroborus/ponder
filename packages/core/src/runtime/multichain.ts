@@ -752,6 +752,8 @@ export async function runMultichain({
               context,
             );
 
+            await sinks.enqueueLive(tx, event.events);
+
             if (database.userQB.$dialect === "pglite") {
               await tx.wrap(
                 (tx) =>
@@ -763,6 +765,8 @@ export async function runMultichain({
           undefined,
           context,
         );
+
+        if (sinks.hasLiveSinks) await sinks.drain();
 
         event.blockCallback?.(true);
 
@@ -804,6 +808,12 @@ export async function runMultichain({
               context,
             );
 
+            await sinks.enqueueReorg(tx, {
+              chain: event.chain,
+              checkpoint: event.checkpoint,
+              events: event.events,
+            });
+
             for (const [index, table] of tables.entries()) {
               common.logger.debug({
                 msg: "Reverted reorged database rows",
@@ -822,6 +832,8 @@ export async function runMultichain({
           undefined,
           context,
         );
+
+        if (sinks.hasLiveSinks) await sinks.drain();
 
         indexingCache.clear();
 

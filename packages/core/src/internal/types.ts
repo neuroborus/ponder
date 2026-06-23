@@ -358,8 +358,8 @@ export type IndexingBuild = {
   }[];
 };
 
-/** A finalized event delivered to an {@link IndexingSink}. */
-export type FinalizedSinkEvent = {
+/** An event delivered to an {@link IndexingSink}. */
+export type SinkEvent = {
   /** Stable Ponder event identifier. */
   id: string;
   /** Ponder checkpoint for this event. */
@@ -374,6 +374,9 @@ export type FinalizedSinkEvent = {
   event: Event["event"];
 };
 
+/** A finalized event delivered to an {@link IndexingSink}. */
+export type FinalizedSinkEvent = SinkEvent;
+
 /** A durable, finalized delivery unit for an {@link IndexingSink}. */
 export type FinalizedSinkBatch = {
   /** Serialized payload format version. */
@@ -385,7 +388,37 @@ export type FinalizedSinkBatch = {
   events: FinalizedSinkEvent[];
 };
 
-/** Structured logger available to a finalized analytics sink. */
+/** A durable, live delivery unit for an {@link IndexingSink}. */
+export type LiveSinkBatch = {
+  /** Serialized payload format version. */
+  version: 1;
+  /** Stable identifier reused across delivery retries. */
+  id: string;
+  /** Checkpoint of the indexed live block. */
+  checkpoint: string;
+  /** Chain that produced every event in `events`. */
+  chain: { id: number; name: string };
+  /** Causal position within this sink and chain. */
+  sequence: bigint;
+  events: SinkEvent[];
+};
+
+/** A durable revocation unit for live events removed by a reorg. */
+export type ReorgSinkBatch = {
+  /** Serialized payload format version. */
+  version: 1;
+  /** Stable identifier reused across delivery retries. */
+  id: string;
+  /** Canonical checkpoint after the reorg. */
+  checkpoint: string;
+  /** Chain that produced every event in `events`. */
+  chain: { id: number; name: string };
+  /** Causal position within this sink and chain. */
+  sequence: bigint;
+  events: SinkEvent[];
+};
+
+/** Structured logger available to an analytics sink. */
 export type SinkLogger = {
   error: (options: SinkLog) => void;
   warn: (options: SinkLog) => void;
@@ -399,19 +432,19 @@ type SinkLog = {
   duration?: number;
 } & Record<string, unknown>;
 
-/** Bounded observability hooks available to a finalized analytics sink. */
+/** Bounded observability hooks available to an analytics sink. */
 export type SinkMetrics = {
   recordRetry: () => void;
 };
 
-/** Runtime context for a finalized analytics sink lifecycle. */
+/** Runtime context for an analytics sink lifecycle. */
 export type SinkSetupContext = {
   logger: SinkLogger;
   metrics: SinkMetrics;
 };
 
 /**
- * Optional analytics projection for finalized Ponder events.
+ * Optional analytics projection for Ponder events.
  *
  * Sink writes are at least once. Implementations must tolerate a batch being
  * delivered again after a successful write but failed acknowledgement. Sinks
@@ -422,6 +455,10 @@ export type IndexingSink = {
   name: string;
   setup?: (context: SinkSetupContext) => Promise<void>;
   writeFinalizedBatch: (batch: FinalizedSinkBatch) => Promise<void>;
+  /** Optional live delivery. Must be paired with `writeReorgBatch`. */
+  writeLiveBatch?: (batch: LiveSinkBatch) => Promise<void>;
+  /** Optional live-event revocation. Must be paired with `writeLiveBatch`. */
+  writeReorgBatch?: (batch: ReorgSinkBatch) => Promise<void>;
   flush?: () => Promise<void>;
   shutdown?: () => Promise<void>;
 };

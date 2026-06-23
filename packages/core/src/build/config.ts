@@ -1101,7 +1101,19 @@ export function buildConfig({
       );
     }
     if (
+      (sink.writeLiveBatch === undefined) !==
+      (sink.writeReorgBatch === undefined)
+    ) {
+      throw new Error(
+        `Validation failed: Sink '${sink.name}' must define writeLiveBatch() and writeReorgBatch() together.`,
+      );
+    }
+    if (
       (sink.setup !== undefined && typeof sink.setup !== "function") ||
+      (sink.writeLiveBatch !== undefined &&
+        typeof sink.writeLiveBatch !== "function") ||
+      (sink.writeReorgBatch !== undefined &&
+        typeof sink.writeReorgBatch !== "function") ||
       (sink.flush !== undefined && typeof sink.flush !== "function") ||
       (sink.shutdown !== undefined && typeof sink.shutdown !== "function")
     ) {

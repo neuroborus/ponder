@@ -1,32 +1,57 @@
 import { createHash } from "node:crypto";
-import { type Database, getPonderSinkDeliveryTable } from "@/database/index.js";
+import {
+  type Database,
+  getPonderSinkDeliveryTable,
+  getPonderSinkSequenceTable,
+} from "@/database/index.js";
 import type { QB } from "@/database/queryBuilder.js";
 import type { Common } from "@/internal/common.js";
 import { NonRetryableUserError } from "@/internal/errors.js";
 import type {
   Event,
   FinalizedSinkBatch,
-  FinalizedSinkEvent,
   IndexingSink,
+  LiveSinkBatch,
   NamespaceBuild,
+  ReorgSinkBatch,
+  SinkEvent,
   SinkSetupContext,
 } from "@/internal/types.js";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import superjson from "superjson";
 
 export type SinkService = {
   start: () => Promise<void>;
   enqueue: (tx: QB, events: Event[]) => Promise<void>;
+  enqueueLive: (tx: QB, events: Event[]) => Promise<void>;
+  enqueueReorg: (
+    tx: QB,
+    params: {
+      chain: { id: number; name: string };
+      checkpoint: string;
+      events: Event[];
+    },
+  ) => Promise<void>;
   drain: () => Promise<void>;
+  hasLiveSinks: boolean;
 };
 
-const createFinalizedSinkBatch = (events: Event[]): FinalizedSinkBatch => {
+type SinkDeliveryKind = "finalized" | "live" | "reorg";
+
+type SinkDeliveryBatch = FinalizedSinkBatch | LiveSinkBatch | ReorgSinkBatch;
+
+type LiveSink = IndexingSink & {
+  writeLiveBatch: NonNullable<IndexingSink["writeLiveBatch"]>;
+  writeReorgBatch: NonNullable<IndexingSink["writeReorgBatch"]>;
+};
+
+const createSinkEvents = (events: Event[]): SinkEvent[] => {
   const sortedEvents = events
     .slice()
     .sort((a, b) => (a.checkpoint < b.checkpoint ? -1 : 1));
 
-  const sinkEvents = sortedEvents.map(
-    (event): FinalizedSinkEvent => ({
+  return sortedEvents.map(
+    (event): SinkEvent => ({
       id: event.event.id,
       checkpoint: event.checkpoint,
       chain: { id: event.chain.id, name: event.chain.name },
@@ -35,6 +60,10 @@ const createFinalizedSinkBatch = (events: Event[]): FinalizedSinkBatch => {
       event: event.event,
     }),
   );
+};
+
+const createFinalizedSinkBatch = (events: Event[]): FinalizedSinkBatch => {
+  const sinkEvents = createSinkEvents(events);
 
   const checkpoint = sinkEvents[sinkEvents.length - 1]!.checkpoint;
   const id = createHash("sha256")
@@ -46,6 +75,79 @@ const createFinalizedSinkBatch = (events: Event[]): FinalizedSinkBatch => {
     .digest("hex");
 
   return { version: 1, id, checkpoint, events: sinkEvents };
+};
+
+const getBatchChain = (events: SinkEvent[]): { id: number; name: string } => {
+  const chain = events[0]!.chain;
+  if (events.some((event) => event.chain.id !== chain.id)) {
+    throw new Error("Live sink batches must contain events from one chain.");
+  }
+  return chain;
+};
+
+const getLiveBatchId = ({
+  kind,
+  checkpoint,
+  events,
+}: {
+  kind: Exclude<SinkDeliveryKind, "finalized">;
+  checkpoint: string;
+  events: SinkEvent[];
+}): string =>
+  createHash("sha256")
+    .update(
+      `${kind}:${checkpoint}\n${events
+        .map((event) => `${event.checkpoint}:${event.name}:${event.id}`)
+        .join("\n")}`,
+    )
+    .digest("hex");
+
+const createLiveSinkBatch = ({
+  events,
+  sequence,
+}: {
+  events: Event[];
+  sequence: bigint;
+}): LiveSinkBatch => {
+  const sinkEvents = createSinkEvents(events);
+  const chain = getBatchChain(sinkEvents);
+  const checkpoint = sinkEvents[sinkEvents.length - 1]!.checkpoint;
+
+  return {
+    version: 1,
+    id: getLiveBatchId({ kind: "live", checkpoint, events: sinkEvents }),
+    checkpoint,
+    chain,
+    sequence,
+    events: sinkEvents,
+  };
+};
+
+const createReorgSinkBatch = ({
+  chain,
+  checkpoint,
+  events,
+  sequence,
+}: {
+  chain: { id: number; name: string };
+  checkpoint: string;
+  events: Event[];
+  sequence: bigint;
+}): ReorgSinkBatch => {
+  const sinkEvents = createSinkEvents(events);
+  const batchChain = getBatchChain(sinkEvents);
+  if (batchChain.id !== chain.id) {
+    throw new Error("Reorg sink batches must match the reorged chain.");
+  }
+
+  return {
+    version: 1,
+    id: getLiveBatchId({ kind: "reorg", checkpoint, events: sinkEvents }),
+    checkpoint,
+    chain,
+    sequence,
+    events: sinkEvents,
+  };
 };
 
 const getDeliveryId = ({
@@ -70,6 +172,11 @@ export const createSinkService = ({
   sinks: readonly IndexingSink[];
 }): SinkService => {
   const PONDER_SINK_DELIVERY = getPonderSinkDeliveryTable(namespace.schema);
+  const PONDER_SINK_SEQUENCE = getPonderSinkSequenceTable(namespace.schema);
+  const liveSinks = sinks.filter(
+    (sink): sink is LiveSink =>
+      sink.writeLiveBatch !== undefined && sink.writeReorgBatch !== undefined,
+  );
 
   const getSetupContext = (sinkName: string): SinkSetupContext => ({
     logger: common.logger.child({ sink: sinkName }),
@@ -79,6 +186,71 @@ export const createSinkService = ({
       },
     },
   });
+
+  const getNextSequence = async ({
+    tx,
+    sinkName,
+    chainId,
+  }: {
+    tx: QB;
+    sinkName: string;
+    chainId: number;
+  }): Promise<bigint> => {
+    const result = await tx.wrap({ label: "advance_sink_sequence" }, (db) =>
+      db
+        .insert(PONDER_SINK_SEQUENCE)
+        .values({ sinkName, chainId, sequence: 1n })
+        .onConflictDoUpdate({
+          target: [PONDER_SINK_SEQUENCE.sinkName, PONDER_SINK_SEQUENCE.chainId],
+          set: { sequence: sql`${PONDER_SINK_SEQUENCE.sequence} + 1` },
+        })
+        .returning(),
+    );
+
+    return result[0]!.sequence;
+  };
+
+  const enqueueLiveDelivery = async ({
+    tx,
+    sink,
+    kind,
+    chain,
+    checkpoint,
+    events,
+  }: {
+    tx: QB;
+    sink: LiveSink;
+    kind: Exclude<SinkDeliveryKind, "finalized">;
+    chain: { id: number; name: string };
+    checkpoint: string;
+    events: Event[];
+  }): Promise<void> => {
+    const sequence = await getNextSequence({
+      tx,
+      sinkName: sink.name,
+      chainId: chain.id,
+    });
+    const batch =
+      kind === "live"
+        ? createLiveSinkBatch({ events, sequence })
+        : createReorgSinkBatch({ chain, checkpoint, events, sequence });
+
+    await tx.wrap({ label: "enqueue_sink_delivery" }, (db) =>
+      db
+        .insert(PONDER_SINK_DELIVERY)
+        .values({
+          id: getDeliveryId({ sinkName: sink.name, batchId: batch.id }),
+          sinkName: sink.name,
+          kind,
+          chainId: chain.id,
+          sequence,
+          checkpoint: batch.checkpoint,
+          payload: superjson.stringify(batch),
+          createdAt: Date.now(),
+        })
+        .onConflictDoNothing(),
+    );
+  };
 
   const drain = async (): Promise<void> => {
     for (const sink of sinks) {
@@ -90,6 +262,8 @@ export const createSinkService = ({
             .from(PONDER_SINK_DELIVERY)
             .where(eq(PONDER_SINK_DELIVERY.sinkName, sink.name))
             .orderBy(
+              asc(PONDER_SINK_DELIVERY.chainId),
+              asc(PONDER_SINK_DELIVERY.sequence),
               asc(PONDER_SINK_DELIVERY.checkpoint),
               asc(PONDER_SINK_DELIVERY.id),
             ),
@@ -101,11 +275,33 @@ export const createSinkService = ({
       );
 
       for (const [index, delivery] of deliveries.entries()) {
-        const batch = superjson.parse<FinalizedSinkBatch>(delivery.payload);
+        const batch = superjson.parse<SinkDeliveryBatch>(delivery.payload);
         const startTime = Date.now();
 
         try {
-          await sink.writeFinalizedBatch(batch);
+          switch (delivery.kind as SinkDeliveryKind) {
+            case "finalized":
+              await sink.writeFinalizedBatch(batch as FinalizedSinkBatch);
+              break;
+            case "live":
+              if (sink.writeLiveBatch === undefined) {
+                throw new Error(
+                  `Sink '${sink.name}' cannot deliver a pending live batch.`,
+                );
+              }
+              await sink.writeLiveBatch(batch as LiveSinkBatch);
+              break;
+            case "reorg":
+              if (sink.writeReorgBatch === undefined) {
+                throw new Error(
+                  `Sink '${sink.name}' cannot deliver a pending reorg batch.`,
+                );
+              }
+              await sink.writeReorgBatch(batch as ReorgSinkBatch);
+              break;
+            default:
+              throw new Error(`Unknown sink delivery kind '${delivery.kind}'.`);
+          }
         } catch (error) {
           const duration = Date.now() - startTime;
           common.metrics.ponder_sink_delivery_total.inc({
@@ -117,8 +313,9 @@ export const createSinkService = ({
             duration,
           );
           common.logger.error({
-            msg: "Failed finalized sink delivery",
+            msg: "Failed sink delivery",
             sink: sink.name,
+            delivery_kind: delivery.kind,
             checkpoint: batch.checkpoint,
             batch_id: batch.id,
             duration,
@@ -148,8 +345,9 @@ export const createSinkService = ({
         );
 
         common.logger.debug({
-          msg: "Delivered finalized sink batch",
+          msg: "Delivered sink batch",
           sink: sink.name,
+          delivery_kind: delivery.kind,
           checkpoint: batch.checkpoint,
           batch_id: batch.id,
           event_count: batch.events.length,
@@ -167,7 +365,7 @@ export const createSinkService = ({
     async start(): Promise<void> {
       if (sinks.length > 0 && database.userQB.$dialect === "pglite") {
         throw new NonRetryableUserError(
-          "Finalized sinks require a Postgres database because PGlite does not provide durable transaction boundaries.",
+          "Analytics sinks require a Postgres database because PGlite does not provide durable transaction boundaries.",
         );
       }
 
@@ -207,6 +405,7 @@ export const createSinkService = ({
             sinks.map((sink) => ({
               id: getDeliveryId({ sinkName: sink.name, batchId: batch.id }),
               sinkName: sink.name,
+              kind: "finalized",
               checkpoint: batch.checkpoint,
               payload: superjson.stringify(batch),
               createdAt: Date.now(),
@@ -215,6 +414,37 @@ export const createSinkService = ({
           .onConflictDoNothing(),
       );
     },
+    async enqueueLive(tx: QB, events: Event[]): Promise<void> {
+      if (liveSinks.length === 0 || events.length === 0) return;
+
+      const chain = getBatchChain(createSinkEvents(events));
+      const checkpoint = events[0]!.checkpoint;
+      for (const sink of liveSinks) {
+        await enqueueLiveDelivery({
+          tx,
+          sink,
+          kind: "live",
+          chain,
+          checkpoint,
+          events,
+        });
+      }
+    },
+    async enqueueReorg(tx, { chain, checkpoint, events }): Promise<void> {
+      if (liveSinks.length === 0 || events.length === 0) return;
+
+      for (const sink of liveSinks) {
+        await enqueueLiveDelivery({
+          tx,
+          sink,
+          kind: "reorg",
+          chain,
+          checkpoint,
+          events,
+        });
+      }
+    },
     drain,
+    hasLiveSinks: liveSinks.length > 0,
   };
 };

@@ -18,6 +18,8 @@ import type {
   Event,
   FinalizedSinkBatch,
   IndexingSink,
+  LiveSinkBatch,
+  ReorgSinkBatch,
   SinkSetupContext,
 } from "@/internal/types.js";
 import { getFinalizedEventsMultichain } from "@/runtime/realtime.js";
@@ -278,6 +280,97 @@ test("replays an unacknowledged delivery", async () => {
   expect(writeFinalizedBatch).toHaveBeenCalledTimes(1);
   expect(replayedBatches).toHaveLength(1);
   expect(replayedBatches[0]!.id).toBe(writeFinalizedBatch.mock.calls[0]![0].id);
+  expect(await getPendingDeliveries(database)).toHaveLength(0);
+});
+
+test("replays live delivery before its reorg revocation", async () => {
+  const { database } = await setupDatabaseServices({
+    namespaceBuild: namespace,
+  });
+  const chain = getChain();
+  const event = createEvent({
+    chain,
+    checkpoint: createCheckpoint({ chainId: chain.id, blockNumber: 2n }),
+  });
+  const reorgCheckpoint = createCheckpoint({
+    chainId: chain.id,
+    blockNumber: 1n,
+  });
+  const writeLiveBatch = vi
+    .fn(async (_batch: LiveSinkBatch) => {})
+    .mockRejectedValueOnce(new Error("unavailable"));
+  const writeReorgBatch = vi.fn(async (_batch: ReorgSinkBatch) => {});
+  const service = createSinkService({
+    common: context.common,
+    database,
+    namespace,
+    sinks: [
+      {
+        name: "test",
+        writeFinalizedBatch: async () => {},
+        writeLiveBatch,
+        writeReorgBatch,
+      },
+    ],
+  });
+
+  await database.userQB.transaction(async (tx) => {
+    await service.enqueueLive(tx, [event]);
+    await service.enqueueReorg(tx, {
+      chain,
+      checkpoint: reorgCheckpoint,
+      events: [event],
+    });
+  });
+
+  await expect(service.drain()).rejects.toThrow("unavailable");
+  expect(writeReorgBatch).not.toHaveBeenCalled();
+
+  const delivered: Array<"live" | "reorg"> = [];
+  const sequences: bigint[] = [];
+  const restartedService = createSinkService({
+    common: context.common,
+    database,
+    namespace,
+    sinks: [
+      {
+        name: "test",
+        writeFinalizedBatch: async () => {},
+        writeLiveBatch: async (batch) => {
+          delivered.push("live");
+          sequences.push(batch.sequence);
+        },
+        writeReorgBatch: async (batch) => {
+          delivered.push("reorg");
+          sequences.push(batch.sequence);
+        },
+      },
+    ],
+  });
+
+  await restartedService.drain();
+
+  expect(delivered).toStrictEqual(["live", "reorg"]);
+  expect(sequences).toStrictEqual([1n, 2n]);
+  expect(await getPendingDeliveries(database)).toHaveLength(0);
+});
+
+test("does not enqueue live delivery for finalized-only sinks", async () => {
+  const { database } = await setupDatabaseServices({
+    namespaceBuild: namespace,
+  });
+  const service = createSinkService({
+    common: context.common,
+    database,
+    namespace,
+    sinks: [{ name: "test", writeFinalizedBatch: async () => {} }],
+  });
+
+  await database.userQB.transaction((tx) =>
+    service.enqueueLive(tx, [createEvent()]),
+  );
+
+  expect(service.hasLiveSinks).toBe(false);
   expect(await getPendingDeliveries(database)).toHaveLength(0);
 });
 
