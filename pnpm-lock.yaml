@@ -51,6 +51,21 @@ importers:
         specifier: workspace:*
         version: link:../packages/core
 
+  clickhouse-acceptance:
+    devDependencies:
+      '@ponder/clickhouse':
+        specifier: workspace:*
+        version: link:../packages/clickhouse
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.11.24
+      ponder:
+        specifier: workspace:*
+        version: link:../packages/core
+      vitest:
+        specifier: 1.6.1
+        version: 1.6.1(@edge-runtime/vm@3.2.0)(@types/node@20.11.24)(lightningcss@1.30.0)
+
   docs:
     dependencies:
       '@clickhouse/client':
