@@ -1,0 +1,137 @@
+# ClickHouse [Finalized analytics]
+
+`@ponder/clickhouse` writes finalized Ponder events to ClickHouse for
+analytics. It is optional: Ponder still uses Postgres for application data,
+checkpoints, migrations, reorg recovery, and its query APIs.
+
+## Requirements
+
+- A Postgres database for Ponder. Sinks are rejected with PGlite.
+- An existing ClickHouse database. The sink can create its event table, but
+  never creates a database or changes an existing table.
+- A stable `projectId` for each Ponder deployment.
+
+## Install
+
+```bash
+pnpm add @ponder/clickhouse
+```
+
+## Configure
+
+Set `DATABASE_URL` and `CLICKHOUSE_URL` in your environment. The ClickHouse URL
+must be an HTTP or HTTPS origin without a path; configure the database name in
+`schema.database` instead.
+
+```ts [ponder.config.ts]
+import { createClickHouseSink } from "@ponder/clickhouse";
+import { createConfig } from "ponder";
+
+const databaseUrl = process.env.DATABASE_URL;
+const clickhouseUrl = process.env.CLICKHOUSE_URL;
+
+if (databaseUrl === undefined || clickhouseUrl === undefined) {
+  throw new Error("DATABASE_URL and CLICKHOUSE_URL are required");
+}
+
+export default createConfig({
+  database: {
+    kind: "postgres",
+    connectionString: databaseUrl,
+  },
+  chains: {
+    mainnet: {
+      id: 1,
+      rpc: process.env.PONDER_RPC_URL_1,
+    },
+  },
+  blocks: {
+    Mainnet: {
+      chain: "mainnet",
+      startBlock: "latest",
+      interval: 1,
+    },
+  },
+  sinks: [
+    createClickHouseSink({
+      url: clickhouseUrl,
+      projectId: "mainnet-analytics",
+      schema: {
+        database: "default",
+        table: "ponder_events",
+        autoCreate: true,
+      },
+    }),
+  ],
+});
+```
+
+`projectId` distinguishes deployments that write to the same table. It must be
+stable across restarts and deployments of the same project.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `schema.database` | `default` | Existing ClickHouse database. |
+| `schema.table` | `ponder_events` | Event table name. |
+| `schema.autoCreate` | `false` | Create the table if it does not exist. |
+| `requestTimeout` | Client default | HTTP request timeout in milliseconds. |
+| `maxRetries` | `3` | Retries after the initial failed request. |
+| `retryDelayMs` | `250` | Initial retry delay in milliseconds. |
+
+Use `username`, `password`, and an `https` URL when your ClickHouse deployment
+requires authentication or TLS. Keep credentials in environment variables or a
+secret manager, not in source control.
+
+## Delivery semantics
+
+Ponder persists each finalized sink batch in its Postgres outbox as part of the
+canonical transaction. It drains that outbox after commit and acknowledges a
+batch only after ClickHouse accepts it.
+
+Delivery is at least once. If ClickHouse accepts a batch but Ponder exits
+before its acknowledgement commits, the batch is delivered again after restart.
+Only finalized events are sent; live events and reorg markers are not part of
+this sink.
+
+After bounded retries are exhausted, indexing fails instead of silently losing
+analytics rows. On restart, Ponder resumes from the durable outbox.
+
+## Query events
+
+The table uses a stable `event_id` and `ReplacingMergeTree`. Use `FINAL` when
+you need one logical row for every event ID:
+
+```sql
+SELECT
+  event_id,
+  block_number,
+  event_name,
+  payload
+FROM default.ponder_events FINAL
+WHERE project_id = 'mainnet-analytics'
+ORDER BY block_number DESC
+LIMIT 100;
+```
+
+Rows include the Ponder checkpoint, block metadata, transaction hash, callback
+name, and a JSON payload. Values that were `bigint` in the event payload are
+encoded as decimal strings.
+
+## Operations
+
+When `autoCreate` is enabled, the ClickHouse user needs permission to create
+the target table. It always needs permission to insert rows; analytics readers
+need `SELECT` permission.
+
+Ponder exposes delivery totals, duration, event count, retries, and pending
+batches with the `ponder_sink_delivery_*` metrics. Sink logs include the batch
+ID, checkpoint, event count, retry count, and operation without logging the
+configured password.
+
+For a runnable local project, see
+[examples/with-clickhouse](https://github.com/ponder-sh/ponder/tree/main/examples/with-clickhouse).
+
+## Scope
+
+This package is a finalized analytics projection. It does not replicate
+Ponder tables, replace Postgres, provide live delivery, or emit reorg markers.

@@ -43,6 +43,7 @@
     "ponder-examples-with-offchain",
     "ponder-examples-with-offchain-offchain",
     "ponder-examples-with-offchain-ponder",
+    "ponder-examples-with-clickhouse",
     "ponder-examples-with-trpc",
     "ponder-examples-with-trpc-ponder",
     "ponder-examples-with-trpc-client"
