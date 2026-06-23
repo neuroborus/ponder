@@ -7,7 +7,7 @@ vi.mock("@clickhouse/client", () => ({
 }));
 
 import { createClient } from "@clickhouse/client";
-import { batch } from "./_test/fixtures.js";
+import { batch, createLiveBatch, createReorgBatch } from "./_test/fixtures.js";
 
 type MockFunction = {
   mockReturnValue: (value: unknown) => void;
@@ -37,6 +37,13 @@ const getExpectedEventId = (
 ): string =>
   createHash("sha256")
     .update(`${event.checkpoint}:${event.name}:${event.id}`)
+    .digest("hex");
+
+const getExpectedLiveEventId = (
+  event: FinalizedSinkBatch["events"][number],
+): string =>
+  createHash("sha256")
+    .update(`${event.chain.id}:${event.checkpoint}:${event.name}:${event.id}`)
     .digest("hex");
 
 beforeEach(() => {
@@ -80,6 +87,15 @@ test("createClickHouseSink() validates the target identity", () => {
       schema: { table: "events; DROP TABLE events" },
     }),
   ).toThrow("schema.table must use letters, numbers, and underscores");
+
+  expect(() =>
+    createClickHouseSink({
+      url: "http://localhost:8123",
+      projectId: "project",
+      live: true,
+      schema: { table: "ponder_events" },
+    }),
+  ).toThrow('schema.table must not be "ponder_events" when live is enabled');
 });
 
 test("createClickHouseSink() creates a versioned event table", async () => {
@@ -101,6 +117,29 @@ test("createClickHouseSink() creates a versioned event table", async () => {
   });
   expect(mocks.command).toHaveBeenCalledWith({
     query: expect.stringContaining("ReplacingMergeTree"),
+  });
+});
+
+test("createClickHouseSink() creates a v2 table in live mode", async () => {
+  const sink = createClickHouseSink({
+    url: "http://localhost:8123",
+    projectId: "project",
+    live: true,
+    schema: { database: "analytics", autoCreate: true },
+  });
+
+  await sink.setup?.(context);
+
+  expect(mocks.command).toHaveBeenCalledWith({
+    query: expect.stringContaining(
+      "CREATE TABLE IF NOT EXISTS analytics.ponder_events_v2",
+    ),
+  });
+  expect(mocks.command).toHaveBeenCalledWith({
+    query: expect.stringContaining("row_kind LowCardinality(String)"),
+  });
+  expect(mocks.command).toHaveBeenCalledWith({
+    query: expect.stringContaining("ReplacingMergeTree(row_version)"),
   });
 });
 
@@ -182,6 +221,59 @@ test("createClickHouseSink() assigns distinct event ids per callback", async () 
   );
 });
 
+test("createClickHouseSink() maps live events and reorg revocations", async () => {
+  const liveBatch = createLiveBatch();
+  const reorgBatch = createReorgBatch();
+  const sink = createClickHouseSink({
+    url: "http://localhost:8123",
+    projectId: "project",
+    live: true,
+  });
+
+  if (sink.writeLiveBatch === undefined || sink.writeReorgBatch === undefined) {
+    throw new Error("Expected a live ClickHouse sink");
+  }
+
+  await sink.writeFinalizedBatch(batch);
+  await sink.writeLiveBatch(liveBatch);
+  await sink.writeReorgBatch(reorgBatch);
+
+  const rows = mocks.insert.mock.calls.map(
+    (call) => (call[0].values as Array<Record<string, unknown>>)[0],
+  );
+
+  expect(rows).toStrictEqual([
+    expect.objectContaining({
+      schema_version: 2,
+      event_id: getExpectedLiveEventId(batch.events[0]!),
+      row_kind: "event",
+      row_version: "0",
+    }),
+    expect.objectContaining({
+      schema_version: 2,
+      event_id: getExpectedLiveEventId(liveBatch.events[0]!),
+      row_kind: "event",
+      row_version: "1",
+    }),
+    expect.objectContaining({
+      schema_version: 2,
+      event_id: getExpectedLiveEventId(reorgBatch.events[0]!),
+      row_kind: "revocation",
+      row_version: "2",
+    }),
+  ]);
+});
+
+test("createClickHouseSink() does not enable live delivery by default", () => {
+  const sink = createClickHouseSink({
+    url: "http://localhost:8123",
+    projectId: "project",
+  });
+
+  expect(sink.writeLiveBatch).toBeUndefined();
+  expect(sink.writeReorgBatch).toBeUndefined();
+});
+
 test("createClickHouseSink() omits contract address for account transaction events", async () => {
   const sourceEvent = batch.events[0]!.event;
   if (!("transaction" in sourceEvent)) {
@@ -242,7 +334,7 @@ test("createClickHouseSink() retries failed writes with bounded attempts", async
   expect(context.logger.warn).toHaveBeenCalledWith(
     expect.objectContaining({
       msg: "Retrying ClickHouse sink request",
-      operation: "write",
+      operation: "write_finalized",
       retry_count: 1,
     }),
   );
@@ -265,7 +357,7 @@ test("createClickHouseSink() fails after exhausted retries", async () => {
   expect(context.logger.error).toHaveBeenCalledWith(
     expect.objectContaining({
       msg: "ClickHouse sink request failed",
-      operation: "write",
+      operation: "write_finalized",
       retry_count: 1,
     }),
   );

@@ -19,6 +19,16 @@ test("createClickHouseSink() config", () => {
   assertType<IndexingSink>(sink);
 });
 
+test("createClickHouseSink() live config", () => {
+  const sink = createClickHouseSink({
+    url: "https://clickhouse.example.com",
+    projectId: "my-indexer",
+    live: true,
+  });
+
+  assertType<IndexingSink>(sink);
+});
+
 test("createClickHouseSink() rejects invalid config types", () => {
   createClickHouseSink({
     url: "https://clickhouse.example.com",
@@ -33,5 +43,12 @@ test("createClickHouseSink() rejects invalid config types", () => {
       // @ts-expect-error autoCreate must be a boolean
       autoCreate: "true",
     },
+  });
+
+  createClickHouseSink({
+    url: "https://clickhouse.example.com",
+    projectId: "my-indexer",
+    // @ts-expect-error live must be a boolean
+    live: "true",
   });
 });

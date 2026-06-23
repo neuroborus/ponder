@@ -1,8 +1,9 @@
-# ClickHouse [Finalized analytics]
+# ClickHouse [Analytics]
 
-`@ponder/clickhouse` writes finalized Ponder events to ClickHouse for
-analytics. It is optional: Ponder still uses Postgres for application data,
-checkpoints, migrations, reorg recovery, and its query APIs.
+`@ponder/clickhouse` writes Ponder events to ClickHouse for analytics. By
+default, it writes only finalized events. Live delivery is an explicit opt-in.
+Ponder still uses Postgres for application data, checkpoints, migrations,
+reorg recovery, and its query APIs.
 
 ## Requirements
 
@@ -71,8 +72,9 @@ stable across restarts and deployments of the same project.
 
 | Option | Default | Description |
 | --- | --- | --- |
+| `live` | `false` | Write provisional events and append reorg revocations. |
 | `schema.database` | `default` | Existing ClickHouse database. |
-| `schema.table` | `ponder_events` | Event table name. |
+| `schema.table` | `ponder_events` / `ponder_events_v2` | Event table name; the v2 default applies when `live` is enabled. |
 | `schema.autoCreate` | `false` | Create the table if it does not exist. |
 | `requestTimeout` | Client default | HTTP request timeout in milliseconds. |
 | `maxRetries` | `3` | Retries after the initial failed request. |
@@ -90,8 +92,6 @@ batch only after ClickHouse accepts it.
 
 Delivery is at least once. If ClickHouse accepts a batch but Ponder exits
 before its acknowledgement commits, the batch is delivered again after restart.
-Only finalized events are sent; live events and reorg markers are not part of
-this sink.
 
 After bounded retries are exhausted, indexing fails instead of silently losing
 analytics rows. On restart, Ponder resumes from the durable outbox.
@@ -117,6 +117,49 @@ Rows include the Ponder checkpoint, block metadata, transaction hash, callback
 name, and a JSON payload. Values that were `bigint` in the event payload are
 encoded as decimal strings.
 
+## Live delivery and reorgs
+
+Set `live: true` to write live events as soon as Ponder's durable sink drain
+runs, without waiting for chain finality.
+
+```ts
+createClickHouseSink({
+  url: clickhouseUrl,
+  projectId: "mainnet-analytics",
+  live: true,
+  schema: { autoCreate: true },
+});
+```
+
+Live mode defaults to a separate `ponder_events_v2` table. It never alters the
+v1 `ponder_events` table; use a different explicitly configured table when
+managing the v2 schema yourself.
+
+The v2 table is append-only. Live event rows have `row_kind = 'event'`; a reorg
+adds a later `row_kind = 'revocation'` row with the same stable `event_id`.
+`row_version` is the durable causal sequence for that sink and chain. Finalized
+batches in live mode are event rows at version `0`, so they do not overwrite a
+later live or revocation state.
+
+Use `FINAL` and filter active rows to hide revoked events deterministically:
+
+```sql
+SELECT
+  event_id,
+  block_number,
+  event_name,
+  payload
+FROM default.ponder_events_v2 FINAL
+WHERE project_id = 'mainnet-analytics'
+  AND row_kind = 'event'
+ORDER BY block_number DESC
+LIMIT 100;
+```
+
+Without `FINAL`, ClickHouse may expose duplicate or superseded rows until its
+background merges finish. Live rows are provisional until finalized; a reorg
+remains visible until its durable revocation batch is delivered.
+
 ## Operations
 
 When `autoCreate` is enabled, the ClickHouse user needs permission to create
@@ -133,5 +176,5 @@ For a runnable local project, see
 
 ## Scope
 
-This package is a finalized analytics projection. It does not replicate
-Ponder tables, replace Postgres, provide live delivery, or emit reorg markers.
+This package is an analytics projection. It does not replicate Ponder tables,
+replace Postgres, or make ClickHouse canonical state.

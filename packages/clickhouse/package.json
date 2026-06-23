@@ -1,7 +1,7 @@
 {
   "name": "@ponder/clickhouse",
   "version": "0.0.0",
-  "description": "Finalized ClickHouse analytics sink for Ponder",
+  "description": "ClickHouse analytics sink for Ponder",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,

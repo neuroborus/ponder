@@ -3,6 +3,7 @@ import { createConfig } from "ponder";
 
 const databaseUrl = process.env.DATABASE_URL;
 const clickhouseUrl = process.env.CLICKHOUSE_URL;
+const live = process.env.PONDER_CLICKHOUSE_LIVE === "true";
 
 if (databaseUrl === undefined || clickhouseUrl === undefined) {
   throw new Error("DATABASE_URL and CLICKHOUSE_URL are required");
@@ -30,6 +31,7 @@ export default createConfig({
     createClickHouseSink({
       url: clickhouseUrl,
       projectId: "with-clickhouse",
+      live,
       schema: { autoCreate: true },
     }),
   ],
