@@ -10,7 +10,7 @@ import type { GetEventFilter } from "./eventFilter.js";
 export type Config = {
   database?: DatabaseConfig;
   ordering?: "omnichain" | "multichain" | "experimental_isolated";
-  /** Finalized analytics sinks. Requires a Postgres database. */
+  /** Analytics sinks. Requires a Postgres database. */
   sinks?: readonly IndexingSink[];
   chains: { [chainName: string]: ChainConfig<unknown> };
   contracts: { [contractName: string]: GetContract };
@@ -29,7 +29,7 @@ export type CreateConfigReturnType<
 > = {
   database?: DatabaseConfig;
   ordering?: "omnichain" | "multichain" | "experimental_isolated";
-  /** Finalized analytics sinks. Requires a Postgres database. */
+  /** Analytics sinks. Requires a Postgres database. */
   sinks?: sinks;
   chains: chains;
   contracts: contracts;
@@ -46,7 +46,7 @@ export const createConfig = <
 >(config: {
   database?: DatabaseConfig;
   ordering?: "omnichain" | "multichain" | "experimental_isolated";
-  /** Finalized analytics sinks. Requires a Postgres database. */
+  /** Analytics sinks. Requires a Postgres database. */
   sinks?: sinks;
   // TODO: add jsdoc to these properties.
   chains: ChainsConfig<Narrow<chains>>;

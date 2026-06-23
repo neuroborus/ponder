@@ -36,7 +36,7 @@ import {
   sql,
 } from "drizzle-orm";
 import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
-import { pgSchema, pgTable } from "drizzle-orm/pg-core";
+import { pgSchema, pgTable, primaryKey } from "drizzle-orm/pg-core";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { Kysely, Migrator, PostgresDialect, WithSchemaPlugin } from "kysely";
 import type { Pool } from "pg";
@@ -97,6 +97,7 @@ export const PONDER_META_TABLE_NAME = "_ponder_meta";
  */
 export const PONDER_CHECKPOINT_TABLE_NAME = "_ponder_checkpoint";
 export const PONDER_SINK_DELIVERY_TABLE_NAME = "_ponder_sink_delivery";
+export const PONDER_SINK_SEQUENCE_TABLE_NAME = "_ponder_sink_sequence";
 /**
  * @dev Used from version 0.9 to 0.11.
  */
@@ -198,6 +199,9 @@ export const getPonderSinkDeliveryTable = (schema?: string) => {
     return pgTable(PONDER_SINK_DELIVERY_TABLE_NAME, (t) => ({
       id: t.text().primaryKey(),
       sinkName: t.text().notNull(),
+      kind: t.text().notNull().default("finalized"),
+      chainId: t.bigint({ mode: "number" }),
+      sequence: t.bigint({ mode: "bigint" }),
       checkpoint: t.varchar({ length: 75 }).notNull(),
       payload: t.text().notNull(),
       createdAt: t.bigint({ mode: "number" }).notNull(),
@@ -207,10 +211,37 @@ export const getPonderSinkDeliveryTable = (schema?: string) => {
   return pgSchema(schema).table(PONDER_SINK_DELIVERY_TABLE_NAME, (t) => ({
     id: t.text().primaryKey(),
     sinkName: t.text().notNull(),
+    kind: t.text().notNull().default("finalized"),
+    chainId: t.bigint({ mode: "number" }),
+    sequence: t.bigint({ mode: "bigint" }),
     checkpoint: t.varchar({ length: 75 }).notNull(),
     payload: t.text().notNull(),
     createdAt: t.bigint({ mode: "number" }).notNull(),
   }));
+};
+
+export const getPonderSinkSequenceTable = (schema?: string) => {
+  if (schema === undefined || schema === "public") {
+    return pgTable(
+      PONDER_SINK_SEQUENCE_TABLE_NAME,
+      (t) => ({
+        sinkName: t.text().notNull(),
+        chainId: t.bigint({ mode: "number" }).notNull(),
+        sequence: t.bigint({ mode: "bigint" }).notNull(),
+      }),
+      (table) => [primaryKey({ columns: [table.sinkName, table.chainId] })],
+    );
+  }
+
+  return pgSchema(schema).table(
+    PONDER_SINK_SEQUENCE_TABLE_NAME,
+    (t) => ({
+      sinkName: t.text().notNull(),
+      chainId: t.bigint({ mode: "number" }).notNull(),
+      sequence: t.bigint({ mode: "bigint" }).notNull(),
+    }),
+    (table) => [primaryKey({ columns: [table.sinkName, table.chainId] })],
+  );
 };
 
 export const createDatabase = ({
@@ -655,6 +686,9 @@ CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_CHECKPOINT_TABLE_NAME
 CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" (
   "id" TEXT PRIMARY KEY,
   "sink_name" TEXT NOT NULL,
+  "kind" TEXT NOT NULL DEFAULT 'finalized',
+  "chain_id" BIGINT,
+  "sequence" BIGINT,
   "checkpoint" VARCHAR(75) NOT NULL,
   "payload" TEXT NOT NULL,
   "created_at" BIGINT NOT NULL
@@ -666,7 +700,53 @@ CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_N
         await tx.wrap(
           (tx) =>
             tx.execute(
+              `ALTER TABLE "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "kind" TEXT NOT NULL DEFAULT 'finalized'`,
+            ),
+          context,
+        );
+
+        await tx.wrap(
+          (tx) =>
+            tx.execute(
+              `ALTER TABLE "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "chain_id" BIGINT`,
+            ),
+          context,
+        );
+
+        await tx.wrap(
+          (tx) =>
+            tx.execute(
+              `ALTER TABLE "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "sequence" BIGINT`,
+            ),
+          context,
+        );
+
+        await tx.wrap(
+          (tx) =>
+            tx.execute(
               `CREATE INDEX IF NOT EXISTS "${PONDER_SINK_DELIVERY_TABLE_NAME}_pending_index" ON "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" ("sink_name", "checkpoint")`,
+            ),
+          context,
+        );
+
+        await tx.wrap(
+          (tx) =>
+            tx.execute(
+              `CREATE INDEX IF NOT EXISTS "${PONDER_SINK_DELIVERY_TABLE_NAME}_sequence_index" ON "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" ("sink_name", "chain_id", "sequence")`,
+            ),
+          context,
+        );
+
+        await tx.wrap(
+          (tx) =>
+            tx.execute(
+              `
+CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_SINK_SEQUENCE_TABLE_NAME}" (
+  "sink_name" TEXT NOT NULL,
+  "chain_id" BIGINT NOT NULL,
+  "sequence" BIGINT NOT NULL,
+  PRIMARY KEY ("sink_name", "chain_id")
+)`,
             ),
           context,
         );
@@ -702,7 +782,7 @@ CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_N
           common.logger.debug({
             msg: "Created internal database objects",
             schema: namespace.schema,
-            table_count: 3,
+            table_count: 4,
             trigger_count: 2,
             duration: endClock(),
           });
@@ -856,6 +936,14 @@ CREATE TABLE IF NOT EXISTS "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_N
               (tx) =>
                 tx.execute(
                   `DROP TABLE IF EXISTS "${namespace.schema}"."${PONDER_SINK_DELIVERY_TABLE_NAME}" CASCADE`,
+                ),
+              context,
+            );
+
+            await tx.wrap(
+              (tx) =>
+                tx.execute(
+                  `DROP TABLE IF EXISTS "${namespace.schema}"."${PONDER_SINK_SEQUENCE_TABLE_NAME}" CASCADE`,
                 ),
               context,
             );

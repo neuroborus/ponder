@@ -66,6 +66,27 @@ test("buildConfig() validates sinks", () => {
       config: { ...config, sinks: [sink, sink] },
     }),
   ).toThrow("Multiple sinks use the name");
+
+  expect(() =>
+    buildConfig({
+      common: context.common,
+      config: {
+        chains: {
+          mainnet: { id: 1, rpc: `http://127.0.0.1:8545/${TEST_POOL_ID}` },
+        },
+        contracts: {},
+        accounts: {},
+        blocks: {},
+        sinks: [
+          {
+            name: "partial",
+            writeFinalizedBatch: async () => {},
+            writeLiveBatch: async () => {},
+          },
+        ],
+      },
+    }),
+  ).toThrow("writeLiveBatch() and writeReorgBatch() together");
 });
 
 test("buildIndexingFunctions() builds topics for multiple events", async () => {

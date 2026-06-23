@@ -53,7 +53,7 @@ export type RealtimeEvent =
       checkpoint: string;
       blockCallback?: (isAccepted: boolean) => void;
     }
-  | { type: "reorg"; chain: Chain; checkpoint: string }
+  | { type: "reorg"; events: Event[]; chain: Chain; checkpoint: string }
   | { type: "finalize"; events: Event[]; chain: Chain; checkpoint: string };
 
 export const getFinalizedEventsMultichain = <
@@ -74,6 +74,29 @@ export const getFinalizedEventsMultichain = <
   }
 
   return { finalizedEvents, remainingEvents };
+};
+
+export const getReorgedEvents = <
+  T extends {
+    chain: Pick<Chain, "id">;
+    event: { block: { number: bigint } };
+  },
+>(
+  events: T[],
+  { chain, blockNumber }: { chain: Pick<Chain, "id">; blockNumber: bigint },
+) => {
+  const reorgedEvents: T[] = [];
+  const remainingEvents: T[] = [];
+
+  for (const event of events) {
+    if (event.chain.id === chain.id && event.event.block.number > blockNumber) {
+      reorgedEvents.push(event);
+    } else {
+      remainingEvents.push(event);
+    }
+  }
+
+  return { reorgedEvents, remainingEvents };
 };
 
 export async function* getRealtimeEventsOmnichain(params: {
@@ -307,15 +330,7 @@ export async function* getRealtimeEventsOmnichain(params: {
         break;
       }
       case "reorg": {
-        const isReorgedEvent = (_event: Event) => {
-          if (
-            _event.chain.id === chain.id &&
-            Number(_event.event.block.number) > hexToNumber(event.block.number)
-          ) {
-            return true;
-          }
-          return false;
-        };
+        const blockNumber = BigInt(event.block.number);
 
         const checkpoint = getOmnichainCheckpoint({
           perChainSync: params.perChainSync,
@@ -324,12 +339,11 @@ export async function* getRealtimeEventsOmnichain(params: {
 
         // Move events from executed to pending
 
-        const reorgedEvents = executedEvents.filter(
-          (e) => e.checkpoint > checkpoint,
+        const { reorgedEvents, remainingEvents } = getReorgedEvents(
+          executedEvents,
+          { chain, blockNumber },
         );
-        executedEvents = executedEvents.filter(
-          (e) => e.checkpoint < checkpoint,
-        );
+        executedEvents = remainingEvents;
         pendingEvents = pendingEvents.concat(reorgedEvents);
 
         params.common.logger.trace({
@@ -338,10 +352,12 @@ export async function* getRealtimeEventsOmnichain(params: {
         });
 
         pendingEvents = pendingEvents.filter(
-          (e) => isReorgedEvent(e) === false,
+          (event) =>
+            event.chain.id !== chain.id ||
+            event.event.block.number <= blockNumber,
         );
 
-        yield { type: "reorg", chain, checkpoint };
+        yield { type: "reorg", events: reorgedEvents, chain, checkpoint };
         break;
       }
     }
@@ -549,32 +565,17 @@ export async function* getRealtimeEventsMultichain(params: {
         break;
       }
       case "reorg": {
-        const isReorgedEvent = (_event: Event) => {
-          if (
-            _event.chain.id === chain.id &&
-            Number(_event.event.block.number) > hexToNumber(event.block.number)
-          ) {
-            return true;
-          }
-          return false;
-        };
+        const blockNumber = BigInt(event.block.number);
 
         const checkpoint = syncProgress.getCheckpoint({ tag: "current" });
 
-        // index of the first reorged event
-        let reorgIndex: number | undefined = undefined;
-        for (const [index, event] of executedEvents.entries()) {
-          if (event.chain.id === chain.id && event.checkpoint > checkpoint) {
-            reorgIndex = index;
-            break;
-          }
-        }
+        const { reorgedEvents, remainingEvents } = getReorgedEvents(
+          executedEvents,
+          { chain, blockNumber },
+        );
+        executedEvents = remainingEvents;
 
-        // Move events from executed to pending
-
-        if (reorgIndex !== undefined) {
-          const reorgedEvents = executedEvents.slice(reorgIndex);
-          executedEvents = executedEvents.slice(0, reorgIndex);
+        if (reorgedEvents.length > 0) {
           pendingEvents = pendingEvents.concat(reorgedEvents);
 
           params.common.logger.trace({
@@ -584,10 +585,12 @@ export async function* getRealtimeEventsMultichain(params: {
         }
 
         pendingEvents = pendingEvents.filter(
-          (e) => isReorgedEvent(e) === false,
+          (event) =>
+            event.chain.id !== chain.id ||
+            event.event.block.number <= blockNumber,
         );
 
-        yield { type: "reorg", chain, checkpoint };
+        yield { type: "reorg", events: reorgedEvents, chain, checkpoint };
         break;
       }
     }
@@ -760,15 +763,18 @@ export async function* getRealtimeEventsIsolated(params: {
         break;
       }
       case "reorg": {
+        const blockNumber = BigInt(event.block.number);
         const checkpoint = params.syncProgress.getCheckpoint({
           tag: "current",
         });
 
-        executedEvents = executedEvents.filter(
-          (event) => event.checkpoint <= checkpoint,
+        const { reorgedEvents, remainingEvents } = getReorgedEvents(
+          executedEvents,
+          { chain, blockNumber },
         );
+        executedEvents = remainingEvents;
 
-        yield { type: "reorg", chain, checkpoint };
+        yield { type: "reorg", events: reorgedEvents, chain, checkpoint };
         break;
       }
     }

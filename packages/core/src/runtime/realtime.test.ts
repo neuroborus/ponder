@@ -1,6 +1,6 @@
 import { ZERO_CHECKPOINT, encodeCheckpoint } from "@/utils/checkpoint.js";
 import { expect, test } from "vitest";
-import { getFinalizedEventsMultichain } from "./realtime.js";
+import { getFinalizedEventsMultichain, getReorgedEvents } from "./realtime.js";
 
 const createCheckpoint = ({
   chainId,
@@ -46,5 +46,36 @@ test("getFinalizedEventsMultichain() does not wait for another chain", () => {
   });
 
   expect(result.finalizedEvents).toStrictEqual([eventB]);
+  expect(result.remainingEvents).toStrictEqual([eventA]);
+});
+
+test("getReorgedEvents() only removes events from the reorged chain", () => {
+  const chainA = { id: 1 };
+  const chainB = { id: 2 };
+  const eventA = {
+    chain: chainA,
+    checkpoint: createCheckpoint({
+      chainId: 1n,
+      blockNumber: 2n,
+      blockTimestamp: 1n,
+    }),
+    event: { block: { number: 2n } },
+  };
+  const eventB = {
+    chain: chainB,
+    checkpoint: createCheckpoint({
+      chainId: 2n,
+      blockNumber: 2n,
+      blockTimestamp: 2n,
+    }),
+    event: { block: { number: 2n } },
+  };
+
+  const result = getReorgedEvents([eventA, eventB], {
+    chain: chainB,
+    blockNumber: 1n,
+  });
+
+  expect(result.reorgedEvents).toStrictEqual([eventB]);
   expect(result.remainingEvents).toStrictEqual([eventA]);
 });
