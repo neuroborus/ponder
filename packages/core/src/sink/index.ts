@@ -9,6 +9,7 @@ import type {
   FinalizedSinkEvent,
   IndexingSink,
   NamespaceBuild,
+  SinkSetupContext,
 } from "@/internal/types.js";
 import { asc, eq } from "drizzle-orm";
 import superjson from "superjson";
@@ -70,6 +71,15 @@ export const createSinkService = ({
 }): SinkService => {
   const PONDER_SINK_DELIVERY = getPonderSinkDeliveryTable(namespace.schema);
 
+  const getSetupContext = (sinkName: string): SinkSetupContext => ({
+    logger: common.logger.child({ sink: sinkName }),
+    metrics: {
+      recordRetry: () => {
+        common.metrics.ponder_sink_delivery_retry_total.inc({ sink: sinkName });
+      },
+    },
+  });
+
   const drain = async (): Promise<void> => {
     for (const sink of sinks) {
       const deliveries = await database.userQB.wrap(
@@ -85,21 +95,51 @@ export const createSinkService = ({
             ),
       );
 
-      for (const delivery of deliveries) {
+      common.metrics.ponder_sink_delivery_pending.set(
+        { sink: sink.name },
+        deliveries.length,
+      );
+
+      for (const [index, delivery] of deliveries.entries()) {
         const batch = superjson.parse<FinalizedSinkBatch>(delivery.payload);
+        const startTime = Date.now();
 
         try {
           await sink.writeFinalizedBatch(batch);
         } catch (error) {
+          const duration = Date.now() - startTime;
+          common.metrics.ponder_sink_delivery_total.inc({
+            sink: sink.name,
+            outcome: "error",
+          });
+          common.metrics.ponder_sink_delivery_duration_ms.observe(
+            { sink: sink.name, outcome: "error" },
+            duration,
+          );
           common.logger.error({
             msg: "Failed finalized sink delivery",
             sink: sink.name,
             checkpoint: batch.checkpoint,
             batch_id: batch.id,
+            duration,
             error: error as Error,
           });
           throw error;
         }
+
+        const duration = Date.now() - startTime;
+        common.metrics.ponder_sink_delivery_total.inc({
+          sink: sink.name,
+          outcome: "success",
+        });
+        common.metrics.ponder_sink_delivery_duration_ms.observe(
+          { sink: sink.name, outcome: "success" },
+          duration,
+        );
+        common.metrics.ponder_sink_delivery_events_total.inc(
+          { sink: sink.name },
+          batch.events.length,
+        );
 
         await database.userQB.wrap({ label: "delete_sink_delivery" }, (db) =>
           db
@@ -114,6 +154,11 @@ export const createSinkService = ({
           batch_id: batch.id,
           event_count: batch.events.length,
         });
+
+        common.metrics.ponder_sink_delivery_pending.set(
+          { sink: sink.name },
+          deliveries.length - index - 1,
+        );
       }
     }
   };
@@ -126,8 +171,18 @@ export const createSinkService = ({
         );
       }
 
-      for (const sink of sinks) {
-        await sink.setup?.();
+      const initializedSinks: IndexingSink[] = [];
+
+      try {
+        for (const sink of sinks) {
+          await sink.setup?.(getSetupContext(sink.name));
+          initializedSinks.push(sink);
+        }
+      } catch (error) {
+        await Promise.allSettled(
+          initializedSinks.map((sink) => sink.shutdown?.()),
+        );
+        throw error;
       }
 
       common.shutdown.add(async () => {

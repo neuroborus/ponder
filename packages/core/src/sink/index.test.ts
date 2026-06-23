@@ -18,6 +18,7 @@ import type {
   Event,
   FinalizedSinkBatch,
   IndexingSink,
+  SinkSetupContext,
 } from "@/internal/types.js";
 import { getFinalizedEventsMultichain } from "@/runtime/realtime.js";
 import { ZERO_CHECKPOINT, encodeCheckpoint } from "@/utils/checkpoint.js";
@@ -322,7 +323,10 @@ test("does not persist a rolled back delivery", async () => {
 });
 
 test("runs the sink lifecycle", async () => {
-  const setup = vi.fn(async () => {});
+  let setupContext: SinkSetupContext | undefined;
+  const setup = vi.fn(async (value: SinkSetupContext) => {
+    setupContext = value;
+  });
   const flush = vi.fn(async () => {});
   const shutdown = vi.fn(async () => {});
   const service = createSinkService({
@@ -349,6 +353,61 @@ test("runs the sink lifecycle", async () => {
   await context.common.shutdown.kill();
 
   expect(setup).toHaveBeenCalledTimes(1);
+  expect(setupContext!.logger).toMatchObject({
+    debug: expect.any(Function),
+    error: expect.any(Function),
+    info: expect.any(Function),
+    warn: expect.any(Function),
+  });
+  setupContext!.metrics.recordRetry();
+  expect(
+    (await context.common.metrics.ponder_sink_delivery_retry_total.get())
+      .values,
+  ).toContainEqual({ labels: { sink: "test" }, value: 1 });
   expect(flush).toHaveBeenCalledTimes(1);
   expect(shutdown).toHaveBeenCalledTimes(1);
+});
+
+test("shuts down initialized sinks when a later setup fails", async () => {
+  const firstSetup = vi.fn(async () => {});
+  const firstShutdown = vi.fn(async () => {});
+  const secondSetup = vi.fn(async () => {
+    throw new Error("setup failed");
+  });
+  const secondShutdown = vi.fn(async () => {});
+  const service = createSinkService({
+    common: context.common,
+    database: {
+      userQB: {
+        $dialect: "postgres",
+        wrap: async () => [],
+      },
+    } as unknown as Database,
+    namespace,
+    sinks: [
+      {
+        name: "first",
+        setup: firstSetup,
+        writeFinalizedBatch: async () => {},
+        shutdown: firstShutdown,
+      },
+      {
+        name: "second",
+        setup: secondSetup,
+        writeFinalizedBatch: async () => {},
+        shutdown: secondShutdown,
+      },
+    ],
+  });
+
+  await expect(service.start()).rejects.toThrow("setup failed");
+
+  expect(firstSetup).toHaveBeenCalledTimes(1);
+  expect(secondSetup).toHaveBeenCalledTimes(1);
+  expect(firstShutdown).toHaveBeenCalledTimes(1);
+  expect(secondShutdown).not.toHaveBeenCalled();
+
+  await context.common.shutdown.kill();
+
+  expect(firstShutdown).toHaveBeenCalledTimes(1);
 });

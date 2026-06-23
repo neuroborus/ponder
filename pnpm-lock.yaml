@@ -737,6 +737,25 @@ importers:
         specifier: ^5.3.2
         version: 5.3.3
 
+  packages/clickhouse:
+    dependencies:
+      '@clickhouse/client':
+        specifier: 1.11.0
+        version: 1.11.0
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.11.24
+      ponder:
+        specifier: workspace:*
+        version: link:../core
+      tsup:
+        specifier: ^8.0.1
+        version: 8.0.1(postcss@8.5.3)(ts-node@10.9.1(@types/node@20.11.24)(typescript@5.3.3))(typescript@5.3.3)
+      vitest:
+        specifier: 1.6.1
+        version: 1.6.1(@edge-runtime/vm@3.2.0)(@types/node@20.11.24)(lightningcss@1.30.0)
+
   packages/client:
     dependencies:
       drizzle-orm:

@@ -94,6 +94,12 @@ export class MetricsService {
   ponder_database_method_duration: prometheus.Histogram<"service" | "method">;
   ponder_database_method_error_total: prometheus.Counter<"service" | "method">;
 
+  ponder_sink_delivery_total: prometheus.Counter<"sink" | "outcome">;
+  ponder_sink_delivery_duration_ms: prometheus.Histogram<"sink" | "outcome">;
+  ponder_sink_delivery_events_total: prometheus.Counter<"sink">;
+  ponder_sink_delivery_retry_total: prometheus.Counter<"sink">;
+  ponder_sink_delivery_pending: prometheus.Gauge<"sink">;
+
   ponder_http_server_active_requests: prometheus.Gauge<"method" | "path">;
   ponder_http_server_request_duration_ms: prometheus.Histogram<
     "method" | "path" | "status"
@@ -370,6 +376,42 @@ export class MetricsService {
       registers: [this.registry],
       aggregator: "sum",
     });
+    this.ponder_sink_delivery_total = new prometheus.Counter({
+      name: "ponder_sink_delivery_total",
+      help: "Total finalized analytics sink deliveries",
+      labelNames: ["sink", "outcome"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_sink_delivery_duration_ms = new prometheus.Histogram({
+      name: "ponder_sink_delivery_duration_ms",
+      help: "Duration of finalized analytics sink deliveries",
+      labelNames: ["sink", "outcome"] as const,
+      buckets: alwaysIODurationMs,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_sink_delivery_events_total = new prometheus.Counter({
+      name: "ponder_sink_delivery_events_total",
+      help: "Total finalized events delivered to analytics sinks",
+      labelNames: ["sink"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_sink_delivery_retry_total = new prometheus.Counter({
+      name: "ponder_sink_delivery_retry_total",
+      help: "Total finalized analytics sink delivery retries",
+      labelNames: ["sink"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_sink_delivery_pending = new prometheus.Gauge({
+      name: "ponder_sink_delivery_pending",
+      help: "Pending finalized analytics sink deliveries",
+      labelNames: ["sink"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
     this.ponder_http_server_active_requests = new prometheus.Gauge({
       name: "ponder_http_server_active_requests",
       help: "Number of active HTTP server requests",
@@ -514,6 +556,11 @@ export class MetricsService {
     // Note: These are used by both indexing and API services.
     this.ponder_database_method_duration.reset();
     this.ponder_database_method_error_total.reset();
+    this.ponder_sink_delivery_total.reset();
+    this.ponder_sink_delivery_duration_ms.reset();
+    this.ponder_sink_delivery_events_total.reset();
+    this.ponder_sink_delivery_retry_total.reset();
+    this.ponder_sink_delivery_pending.reset();
     this.ponder_postgres_pool_connections?.reset();
     this.ponder_postgres_query_queue_size?.reset();
     this.ponder_postgres_query_total?.reset();

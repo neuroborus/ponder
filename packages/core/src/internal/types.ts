@@ -385,6 +385,31 @@ export type FinalizedSinkBatch = {
   events: FinalizedSinkEvent[];
 };
 
+/** Structured logger available to a finalized analytics sink. */
+export type SinkLogger = {
+  error: (options: SinkLog) => void;
+  warn: (options: SinkLog) => void;
+  info: (options: SinkLog) => void;
+  debug: (options: SinkLog) => void;
+};
+
+type SinkLog = {
+  msg: string;
+  error?: Error;
+  duration?: number;
+} & Record<string, unknown>;
+
+/** Bounded observability hooks available to a finalized analytics sink. */
+export type SinkMetrics = {
+  recordRetry: () => void;
+};
+
+/** Runtime context for a finalized analytics sink lifecycle. */
+export type SinkSetupContext = {
+  logger: SinkLogger;
+  metrics: SinkMetrics;
+};
+
 /**
  * Optional analytics projection for finalized Ponder events.
  *
@@ -395,7 +420,7 @@ export type FinalizedSinkBatch = {
  */
 export type IndexingSink = {
   name: string;
-  setup?: () => Promise<void>;
+  setup?: (context: SinkSetupContext) => Promise<void>;
   writeFinalizedBatch: (batch: FinalizedSinkBatch) => Promise<void>;
   flush?: () => Promise<void>;
   shutdown?: () => Promise<void>;
